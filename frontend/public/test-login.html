@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 5px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        #result {
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .success { color: #4CAF50; }
+        .error { color: #f44336; }
+    </style>
+</head>
+<body>
+    <h1>🧪 TrainerOS Login Test</h1>
+    
+    <div>
+        <h3>Test Correct Credentials:</h3>
+        <button onclick="testLogin('test@example.com', 'test123')">
+            ✅ Test: test@example.com / test123
+        </button>
+    </div>
+
+    <div>
+        <h3>Test Wrong Password:</h3>
+        <button onclick="testLogin('test@example.com', 'wrongpassword')">
+            ❌ Test: Wrong Password
+        </button>
+    </div>
+
+    <div>
+        <h3>Test Non-Existent Email:</h3>
+        <button onclick="testLogin('nonexistent@example.com', 'test123')">
+            ❌ Test: Non-Existent Email
+        </button>
+    </div>
+
+    <div id="result"></div>
+
+    <script>
+        async function testLogin(email, password) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.innerHTML = '🔄 Testing login...';
+
+            try {
+                console.log('🔵 Sending login request:', { email, password: '***' });
+                
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+
+                console.log('🔵 Response status:', response.status);
+                const data = await response.json();
+                console.log('🔵 Response data:', data);
+
+                if (response.ok) {
+                    resultDiv.innerHTML = `<span class="success">✅ SUCCESS!</span>\n\n` +
+                        `Status: ${response.status}\n` +
+                        `Email: ${data.user.email}\n` +
+                        `Name: ${data.user.name}\n` +
+                        `Plan: ${data.user.plan}\n` +
+                        `Token: ${data.accessToken.substring(0, 50)}...\n\n` +
+                        `Full response:\n${JSON.stringify(data, null, 2)}`;
+                } else {
+                    resultDiv.innerHTML = `<span class="error">❌ FAILED!</span>\n\n` +
+                        `Status: ${response.status}\n` +
+                        `Error: ${data.error || data.message || 'Unknown error'}\n\n` +
+                        `Full response:\n${JSON.stringify(data, null, 2)}`;
+                }
+            } catch (error) {
+                console.error('🔴 Error:', error);
+                resultDiv.innerHTML = `<span class="error">❌ NETWORK ERROR!</span>\n\n` +
+                    `Error: ${error.message}\n\n` +
+                    `This might mean:\n` +
+                    `- Backend is not running\n` +
+                    `- CORS issue\n` +
+                    `- Network problem\n\n` +
+                    `Check browser console (F12) for details.`;
+            }
+        }
+    </script>
+</body>
+</html>

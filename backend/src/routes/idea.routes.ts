@@ -1,0 +1,42 @@
+import { Router } from 'express';
+import * as ideaController from '../controllers/idea.controller.js';
+import { authenticate, requirePlan } from '../middleware/auth.middleware.js';
+
+const router = Router();
+
+router.post(
+  '/generate',
+  authenticate,
+  requirePlan('FREE_TRIAL', 'STARTER', 'PRO', 'ELITE', 'MAX'),
+  ideaController.generate
+);
+
+router.post(
+  '/generate/multi-format',
+  authenticate,
+  requirePlan('FREE_TRIAL', 'STARTER', 'PRO', 'ELITE', 'MAX'),
+  ideaController.generateMultiFormat
+);
+
+router.post(
+  '/structure',
+  authenticate,
+  requirePlan('FREE_TRIAL', 'STARTER', 'PRO', 'ELITE', 'MAX'),
+  ideaController.structure
+);
+
+router.get(
+  '/history',
+  authenticate,
+  requirePlan('FREE_TRIAL', 'STARTER', 'PRO', 'ELITE', 'MAX'),
+  ideaController.getHistory
+);
+
+router.get(
+  '/:id',
+  authenticate,
+  requirePlan('FREE_TRIAL', 'STARTER', 'PRO', 'ELITE', 'MAX'),
+  ideaController.getById
+);
+
+export default router;

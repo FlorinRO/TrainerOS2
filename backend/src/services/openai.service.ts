@@ -1,0 +1,3352 @@
+import OpenAI from 'openai';
+import { createReadStream } from 'fs';
+import { createGeminiText } from '../lib/gemini.js';
+
+const transcriptionClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+async function generateAnthropicText(prompt: string, temperature: number, maxTokens: number): Promise<string> {
+  return createGeminiText(
+    [{ role: 'user', content: prompt }],
+    {
+      temperature,
+      maxTokens,
+    }
+  );
+}
+
+const ANTHROPIC_JSON_SYSTEM_PROMPT = `Return only strict valid JSON.
+- No markdown
+- No code fences
+- Output must start with { and end with }
+- Use double quotes for all property names and string values
+- Escape any internal double quotes inside string values
+- Escape line breaks inside string values as \\n instead of literal new lines
+- Do not include commentary before or after the JSON
+- Do not leave trailing commas
+- If a value contains quoted speech, prefer apostrophes instead of double quotes`;
+
+async function generateAnthropicJson(prompt: string, temperature: number, maxTokens: number): Promise<string> {
+  return createGeminiText(
+    [{ role: 'user', content: prompt }],
+    {
+      system: ANTHROPIC_JSON_SYSTEM_PROMPT,
+      temperature,
+      maxTokens,
+    }
+  );
+}
+
+async function generateAnthropicTextFromMessages(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  temperature: number,
+  maxTokens: number
+): Promise<string> {
+  const system = messages
+    .filter((message) => message.role === 'system')
+    .map((message) => message.content.trim())
+    .filter(Boolean)
+    .join('\n\n');
+
+  return createGeminiText(
+    messages
+      .filter((message): message is { role: 'user' | 'assistant'; content: string } => message.role !== 'system')
+      .map((message) => ({ role: message.role, content: message.content })),
+    {
+      system: system || undefined,
+      temperature,
+      maxTokens,
+    }
+  );
+}
+
+function normalizeModelJson(content: string | null | undefined): string {
+  const raw = (content || '{}').trim();
+  const withoutCodeFence = raw
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  const firstBrace = withoutCodeFence.indexOf('{');
+  const lastBrace = withoutCodeFence.lastIndexOf('}');
+
+  const extracted =
+    firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace
+      ? withoutCodeFence.slice(firstBrace, lastBrace + 1)
+      : withoutCodeFence;
+
+  return extracted
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'");
+}
+
+function extractFirstJsonObject(content: string): string {
+  let startIndex = -1;
+  let depth = 0;
+  let inString = false;
+  let isEscaped = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+
+    if (startIndex === -1) {
+      if (char === '{') {
+        startIndex = index;
+        depth = 1;
+      }
+      continue;
+    }
+
+    if (inString) {
+      if (isEscaped) {
+        isEscaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        isEscaped = true;
+        continue;
+      }
+
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return content.slice(startIndex, index + 1);
+      }
+    }
+  }
+
+  return content;
+}
+
+function escapeInvalidJsonStringChars(content: string): string {
+  let result = '';
+  let inString = false;
+  let isEscaped = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+
+    if (inString) {
+      if (isEscaped) {
+        result += char;
+        isEscaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        result += char;
+        isEscaped = true;
+        continue;
+      }
+
+      if (char === '"') {
+        result += char;
+        inString = false;
+        continue;
+      }
+
+      if (char === '\n') {
+        result += '\\n';
+        continue;
+      }
+
+      if (char === '\r') {
+        result += '\\r';
+        continue;
+      }
+
+      if (char === '\t') {
+        result += '\\t';
+        continue;
+      }
+
+      if (char < ' ') {
+        continue;
+      }
+
+      result += char;
+      continue;
+    }
+
+    result += char;
+
+    if (char === '"') {
+      inString = true;
+    }
+  }
+
+  return result;
+}
+
+function applyJsonHeuristics(content: string): string {
+  return content
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/([{,]\s*)'([^']+)'(\s*:)/g, '$1"$2"$3')
+    .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3')
+    .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, value) => {
+      const escaped = String(value).replace(/"/g, '\\"');
+      return `: "${escaped}"`;
+    });
+}
+
+async function repairModelJsonWithAnthropic(content: string): Promise<string> {
+  const prompt = `Primești un JSON invalid generat de un model.
+
+Repară-l astfel încât să fie JSON valid, fără să schimbi structura, cheile sau sensul valorilor.
+- Escape pentru ghilimele interne din stringuri
+- Escape pentru newline-uri din stringuri
+- Elimină markdown/code fences
+- Returnează DOAR JSON valid, fără explicații
+
+JSON INVALID:
+${content}`;
+
+  return await generateAnthropicText(prompt, 0, 2800);
+}
+
+async function repairModelJson<T>(content: string): Promise<T> {
+  const repaired = await repairModelJsonWithAnthropic(content);
+  const normalized = applyJsonHeuristics(normalizeModelJson(repaired));
+  return JSON.parse(normalized) as T;
+}
+
+async function parseModelJson<T>(content: string | null | undefined): Promise<T> {
+  const normalized = extractFirstJsonObject(normalizeModelJson(content));
+  const sanitized = escapeInvalidJsonStringChars(normalized);
+  const heuristicNormalized = applyJsonHeuristics(sanitized);
+
+  try {
+    return JSON.parse(sanitized) as T;
+  } catch {
+    try {
+      return JSON.parse(heuristicNormalized) as T;
+    } catch {
+      return repairModelJson<T>(heuristicNormalized);
+    }
+  }
+}
+
+// ==================== NICHE FINDER ====================
+
+export interface NicheFinderQuickInput {
+  quickNiche: string;
+}
+
+export interface NicheQuickICPInput {
+  gender: string;
+  ageRanges: string[];
+  customAgeRange?: string;
+  wakeUpTime?: string;
+  jobType?: string;
+  sittingTime?: string;
+  morning?: string[];
+  lunch?: string[];
+  evening?: string[];
+  definingSituations?: string[];
+  kidsImpact?: string[];
+  activeStatus?: string[];
+  physicalJobIssue?: string[];
+  painDetails?: string[];
+  differentiation?: string;
+  internalObjections?: string[];
+}
+
+export interface NicheFinderWizardInput {
+  q1: string; // Cu cine îți place cel mai mult să lucrezi?
+  q2: string; // Ce problemă rezolvi cel mai bine?
+  q3: string; // Ce rezultate poți demonstra?
+  q4: string; // Ce tip de client vrei să eviți?
+  q5: string; // De ce te-ar alege pe tine?
+}
+
+export interface NicheResult {
+  niche: string;
+  idealClient: string;
+  positioning: string;
+}
+
+function normalizeTextField(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function ensureCompleteNicheResult(
+  partial: Partial<NicheResult>,
+  contextHint: string
+): NicheResult {
+  const niche = normalizeTextField(partial.niche) || 'Nișă fitness personalizată';
+  const idealClient =
+    normalizeTextField(partial.idealClient) ||
+    `Clientul ideal pentru "${niche}" este persoana care se regăsește clar în contextul descris: ${contextHint}. Are nevoie de o soluție aplicabilă, realistă și adaptată stilului ei de viață, nu de sfaturi generale. Caută claritate, progres vizibil și un plan care să poată fi urmat consecvent fără să-i complice și mai mult programul.`;
+  const positioning =
+    normalizeTextField(partial.positioning) ||
+    `Ajut persoanele din nișa "${niche}" să obțină rezultate reale printr-o abordare clară, adaptată contextului lor zilnic și nevoilor lor reale. Fokusul nu este pe recomandări generale, ci pe pași practici care pot fi aplicați consecvent și care duc la progres vizibil.`;
+
+  return {
+    niche,
+    idealClient,
+    positioning,
+  };
+}
+
+export async function generateNicheQuick(input: NicheFinderQuickInput): Promise<NicheResult> {
+  const prompt = `Tu ești un expert în marketing fitness. Analizează această nișă și creează:
+
+1. Nișa clară și specifică (1 propoziție precisă)
+2. Profilul clientului ideal (demografic + psihografic, 2-3 propoziții)
+3. Mesaj de poziționare (1-2 propoziții, unique value proposition)
+
+Nișa introdusă: "${input.quickNiche}"
+
+Răspunde DOAR în format JSON strict, fără markdown.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "niche": "Nișa ta specifică aici",
+  "idealClient": "Profilul complet al clientului ideal",
+  "positioning": "Mesajul tău de poziționare unic"
+}`;
+
+  const content = await generateAnthropicJson(prompt, 0.7, 500);
+  const parsed = await parseModelJson<Partial<NicheResult>>(content);
+  return ensureCompleteNicheResult(parsed, input.quickNiche);
+}
+
+export async function generateNicheQuickICP(input: NicheQuickICPInput): Promise<NicheResult> {
+  const prompt = `Tu ești un expert în marketing fitness. Pe baza descrierii clientului ideal, creează:
+
+1. Nișa clară și specifică (1 propoziție precisă)
+2. Profilul clientului ideal DETALIAT (demografic + psihografic + rutina zilnică + pain points, 4-5 paragrafe)
+3. Mesaj de poziționare (1-2 propoziții, unique value proposition)
+
+PROFILUL CLIENTULUI IDEAL:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👥 Gen: ${input.gender}
+🎯 Vârstă: ${input.ageRanges.join(', ')}${input.customAgeRange ? ` + ${input.customAgeRange}` : ''}
+
+RUTINA ZILNICĂ:
+⏰ Trezire: ${input.wakeUpTime || 'N/A'}
+💼 Job: ${input.jobType || 'N/A'}
+🪑 Timp șezând: ${input.sittingTime || 'N/A'}
+🌅 Dimineața: ${input.morning?.join(', ') || 'N/A'}
+🍽️ Prânz: ${input.lunch?.join(', ') || 'N/A'}
+🌙 Seara: ${input.evening?.join(', ') || 'N/A'}
+
+SITUAȚII DEFINITORII:
+${input.definingSituations?.join(', ') || 'N/A'}
+${input.kidsImpact?.length ? `\n🧒 Impact copii: ${input.kidsImpact.join(', ')}` : ''}
+${input.activeStatus?.length ? `\n💪 Status sport: ${input.activeStatus.join(', ')}` : ''}
+${input.physicalJobIssue?.length ? `\n🏗️ Probleme job fizic: ${input.physicalJobIssue.join(', ')}` : ''}
+${input.painDetails?.length ? `\n🩹 Dureri/limitări: ${input.painDetails.join(', ')}` : ''}
+${input.differentiation ? `\n🟦 Diferențiere antrenor: ${input.differentiation}` : ''}
+${input.internalObjections?.length ? `\n⚠️ Obiecții interne: ${input.internalObjections.join(', ')}` : ''}
+
+IMPORTANT: Pentru "idealClient", scrie un profil COMPLET (4-5 paragrafe) care combină:
+- Demografic (gen, vârstă)
+- Rutina zilnică (job, program, mese, energie)
+- Pain points și obstacole
+- Situații definitorii și cum le afectează viața
+- Obiecții interne dominante și cum îi țin pe loc
+
+Răspunde DOAR în format JSON strict, fără markdown.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "niche": "Nișa ta specifică aici",
+  "idealClient": "Profilul DETALIAT al clientului ideal (4-5 paragrafe în proză, nu bullet points)",
+  "positioning": "Mesajul tău de poziționare unic"
+}`;
+
+  const content = await generateAnthropicJson(prompt, 0.7, 900);
+  const parsed = await parseModelJson<Partial<NicheResult>>(content);
+  const contextHint = [
+    `gen ${input.gender}`,
+    `vârste ${input.ageRanges.join(', ')}${input.customAgeRange ? `, plus ${input.customAgeRange}` : ''}`,
+    input.jobType ? `job ${input.jobType}` : '',
+    input.sittingTime ? `sedentarism ${input.sittingTime}` : '',
+    input.definingSituations?.length ? `situații ${input.definingSituations.join(', ')}` : '',
+    input.differentiation ? `diferențiere ${input.differentiation}` : '',
+  ]
+    .filter(Boolean)
+    .join('; ');
+  return ensureCompleteNicheResult(parsed, contextHint);
+}
+
+export async function generateNicheWizard(input: NicheFinderWizardInput): Promise<NicheResult> {
+  const prompt = `Tu ești un expert în marketing fitness. Pe baza răspunsurilor antrenorului, creează:
+
+1. Nișa clară și specifică (1 propoziție precisă)
+2. Profilul clientului ideal (demografic + psihografic, 2-3 propoziții)
+3. Mesaj de poziționare (1-2 propoziții, unique value proposition)
+
+Răspunsuri antrenor:
+1. Cu cine îmi place să lucrez: "${input.q1}"
+2. Problema pe care o rezolv cel mai bine: "${input.q2}"
+3. Rezultate pe care le pot demonstra: "${input.q3}"
+4. Tip de client pe care vreau să-l evit: "${input.q4}"
+5. De ce m-ar alege pe mine: "${input.q5}"
+
+Răspunde DOAR în format JSON strict, fără markdown.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "niche": "Nișa ta specifică aici",
+  "idealClient": "Profilul complet al clientului ideal",
+  "positioning": "Mesajul tău de poziționare unic"
+}`;
+
+  const content = await generateAnthropicJson(prompt, 0.7, 600);
+  const parsed = await parseModelJson<Partial<NicheResult>>(content);
+  const contextHint = [
+    input.q1,
+    input.q2,
+    input.q3,
+    input.q4,
+    input.q5,
+  ]
+    .filter(Boolean)
+    .join('; ');
+  return ensureCompleteNicheResult(parsed, contextHint);
+}
+
+// ==================== DAILY IDEA GENERATOR ====================
+
+export interface DailyIdeaInput {
+  niche: string;
+  icpProfile?: any;
+  contentPreferences?: any;
+  objective?: 'lead-gen' | 'engagement' | 'education';
+  general?: boolean;
+  recentIdeas?: {
+    format: string;
+    hook: string;
+    cta?: string;
+    createdAt?: string;
+  }[];
+}
+
+export interface Scene {
+  scene: number;
+  text: string;
+  visual: string;
+}
+
+export interface DailyIdeaResult {
+  format: 'REEL' | 'CAROUSEL' | 'STORY';
+  hook: string;
+  script: Scene[];
+  cta: string;
+  objective: string;
+  conversionRate: number;
+  leadMagnet: string;
+  dmKeyword: string;
+  reasoning: string;
+}
+
+export interface MultiFormatIdeaResult {
+  reel: DailyIdeaResult;
+  carousel: DailyIdeaResult;
+  story: DailyIdeaResult;
+}
+
+export interface StructuredIdeaSection {
+  sectionTitle: string;
+  text: string;
+}
+
+export interface StructuredIdeaResult {
+  mainIdea: string;
+  hooks: string[];
+  script: StructuredIdeaSection[];
+  cta: string;
+  ctaStyleApplied: string;
+  improvements: string[];
+}
+
+const STRUCTURED_IDEA_SECTION_TITLES = [
+  'PARTEA 1 – Context',
+  'PARTEA 2 – Explicație clară',
+  'PARTEA 3 – Exemplu / aplicație',
+  'PARTEA 4 – Principiu final',
+] as const;
+
+const STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS = [
+  'Mesaj clarificat',
+  'Redundanță eliminată',
+  'Structură adăugată',
+  'Ton adaptat la nișă',
+] as const;
+
+function normalizeTextValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeTextValue(item)).filter(Boolean);
+  }
+
+  const singleValue = normalizeTextValue(value);
+  return singleValue ? [singleValue] : [];
+}
+
+function collectStructuredIdeaText(value: unknown): string[] {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    return normalized ? [normalized] : [];
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .flatMap((item) => collectStructuredIdeaText(item))
+      .filter(Boolean);
+  }
+
+  if (!value || typeof value !== 'object') {
+    return [];
+  }
+
+  const source = value as Record<string, unknown>;
+  const preferredKeys = [
+    'text',
+    'content',
+    'body',
+    'scriptText',
+    'description',
+    'sectionContent',
+    'copy',
+    'paragraph',
+    'paragraphs',
+    'value',
+    'contentText',
+    'script',
+    'details',
+  ];
+
+  for (const key of preferredKeys) {
+    const extracted = collectStructuredIdeaText(source[key]);
+    if (extracted.length > 0) {
+      return extracted;
+    }
+  }
+
+  return Object.entries(source)
+    .filter(([key]) => !['sectionTitle', 'title', 'heading', 'name', 'label'].includes(key))
+    .flatMap(([, nestedValue]) => collectStructuredIdeaText(nestedValue))
+    .filter(Boolean);
+}
+
+function normalizeStructuredIdeaTitle(value: unknown): string {
+  if (!value || typeof value !== 'object') {
+    return '';
+  }
+
+  const source = value as Record<string, unknown>;
+  return (
+    normalizeTextValue(source.sectionTitle) ||
+    normalizeTextValue(source.title) ||
+    normalizeTextValue(source.heading) ||
+    normalizeTextValue(source.name) ||
+    normalizeTextValue(source.label)
+  );
+}
+
+function normalizeStructuredIdeaScript(value: unknown): StructuredIdeaSection[] {
+  const rawScript = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object'
+      ? Object.values(value as Record<string, unknown>)
+      : [];
+  const fallbackScript = STRUCTURED_IDEA_SECTION_TITLES.map((defaultTitle) => ({
+    sectionTitle: defaultTitle,
+    text: '',
+  }));
+
+  if (!rawScript.length) {
+    return fallbackScript;
+  }
+
+  return rawScript.map((part, index) => {
+    const textParts = collectStructuredIdeaText(part);
+
+    return {
+      sectionTitle:
+        normalizeStructuredIdeaTitle(part) ||
+        STRUCTURED_IDEA_SECTION_TITLES[index] ||
+        `PARTEA ${index + 1}`,
+      text: textParts.join('\n\n').trim(),
+    };
+  });
+}
+
+function normalizeStructuredIdeaSectionText(section: Record<string, unknown>): string {
+  return collectStructuredIdeaText(section).join('\n\n').trim();
+}
+
+function looksLikeStructuredIdeaPlaceholder(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+
+  return (
+    normalized === 'string' ||
+    normalized === 'text' ||
+    normalized === 'placeholder' ||
+    /^partea\s+\d+\s*[–-]\s*/i.test(normalized) ||
+    normalized.startsWith('hook') ||
+    normalized.startsWith('cta')
+  );
+}
+
+function normalizeStructuredIdeaResult(
+  value: unknown,
+  fallbackCtaStyle: string
+): StructuredIdeaResult {
+  const source = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  const hooks = normalizeStringArray(source.hooks).slice(0, 2);
+  const script = normalizeStructuredIdeaScript(source.script);
+
+  const improvements = normalizeStringArray(source.improvements).slice(0, 4);
+
+  return {
+    mainIdea: normalizeTextValue(source.mainIdea),
+    hooks:
+      hooks.length > 0
+        ? [...hooks, ...Array.from({ length: Math.max(0, 2 - hooks.length) }, () => '')]
+        : ['', ''],
+    script,
+    cta: normalizeTextValue(source.cta),
+    ctaStyleApplied: normalizeTextValue(source.ctaStyleApplied) || fallbackCtaStyle,
+    improvements:
+      improvements.length > 0
+        ? [
+            ...improvements,
+            ...STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS.slice(improvements.length),
+          ].slice(0, 4)
+        : [...STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS],
+  };
+}
+
+function isStructuredIdeaResultIncomplete(result: StructuredIdeaResult): boolean {
+  if (!result.mainIdea || looksLikeStructuredIdeaPlaceholder(result.mainIdea)) {
+    return true;
+  }
+
+  if (result.hooks.length < 2 || result.hooks.some((hook) => looksLikeStructuredIdeaPlaceholder(hook))) {
+    return true;
+  }
+
+  if (
+    result.script.length < STRUCTURED_IDEA_SECTION_TITLES.length ||
+    result.script.some((section) => {
+      const text = section.text.trim();
+      return !text || looksLikeStructuredIdeaPlaceholder(text) || text.split(/\s+/).length < 40;
+    })
+  ) {
+    return true;
+  }
+
+  return !result.cta || looksLikeStructuredIdeaPlaceholder(result.cta);
+}
+
+function buildStructuredIdeaPrompt(input: {
+  ideaText: string;
+  niche: string;
+  contentPreferences?: any;
+}): { prompt: string; ctaStyle: string } {
+  const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const ctaStyle = input.contentPreferences?.brandVoice?.ctaStyle || 'Mix';
+
+  const prompt = `Tu ești un expert în content fitness și copywriting conversațional pentru Reels.
+
+TASK:
+Primești o idee brută scrisă de utilizator. NU doar reformulezi.
+Trebuie să:
+1) Identifici ideea principală
+2) Clarifici mesajul fără să schimbi sensul
+3) Elimini redundanța
+4) Adaptezi la nișă
+5) Creezi structură Hook -> Conținut -> CTA
+6) Îmbunătățești formularea
+7) Păstrezi vocea utilizatorului
+
+CONTEXT:
+📍 NIȘĂ: "${input.niche}"
+🗣️ BRAND VOICE:
+${brandVoiceSection}
+🎯 STIL CTA PREFERAT: ${ctaStyle}
+
+IDEEA BRUTĂ UTILIZATOR:
+"""
+${input.ideaText}
+"""
+
+REGULI OBLIGATORII:
+- Sună conversațional, natural, ca într-un Reel (30-60 secunde), nu ca articol.
+- Nu folosi formulări rigide, academice, corporatiste sau sloganistice.
+- Nu adăuga informații complet noi dacă nu sunt necesare.
+- Păstrează ideea originală a utilizatorului.
+- Respectă nișa.
+- Nu returna placeholder-e precum "string", titluri simple sau secțiuni goale.
+- Fiecare câmp text trebuie să conțină conținut complet, nu etichete.
+
+OUTPUT CERUT:
+1) mainIdea: ideea principală (1 propoziție clară)
+2) hooks: exact 2 variante de hook (specifice nișei, 8-14 cuvinte fiecare)
+3) script: 4 secțiuni:
+   - "PARTEA 1 – Context"
+   - "PARTEA 2 – Explicație clară"
+   - "PARTEA 3 – Exemplu / aplicație"
+   - "PARTEA 4 – Principiu final"
+4) cta: CTA adaptat stilului CTA preferat
+5) ctaStyleApplied: stilul CTA aplicat
+6) improvements: listă cu EXACT 4 itemi:
+   - "Mesaj clarificat"
+   - "Redundanță eliminată"
+   - "Structură adăugată"
+   - "Ton adaptat la nișă"
+
+LUNGIME OBLIGATORIE (IMPORTANT):
+- Script total: 500-800 cuvinte.
+- Fiecare secțiune din script: minimum 110-170 cuvinte.
+- Fiecare secțiune trebuie să fie completă, fluentă, fără bullets.
+- CTA: minimum 30-55 cuvinte, clar și acționabil.
+
+CALITATE OBLIGATORIE:
+- Text conversațional, natural, fără formulări rigide.
+- Fiecare secțiune trebuie să conțină explicație concretă, nu doar afirmații.
+- Menține ideea utilizatorului, dar o dezvoltă clar și coerent.
+
+Răspunde DOAR JSON strict.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Fără newline-uri literale în valorile string; folosește \\n doar dacă este necesar
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "mainIdea": "string",
+  "hooks": ["string", "string"],
+  "script": [
+    {"sectionTitle": "PARTEA 1 – Context", "text": "string"},
+    {"sectionTitle": "PARTEA 2 – Explicație clară", "text": "string"},
+    {"sectionTitle": "PARTEA 3 – Exemplu / aplicație", "text": "string"},
+    {"sectionTitle": "PARTEA 4 – Principiu final", "text": "string"}
+  ],
+  "cta": "string",
+  "ctaStyleApplied": "string",
+  "improvements": [
+    "Mesaj clarificat",
+    "Redundanță eliminată",
+    "Structură adăugată",
+    "Ton adaptat la nișă"
+  ]
+}`;
+
+  return { prompt, ctaStyle };
+}
+
+async function generateStructuredIdeaFallback(
+  input: {
+    ideaText: string;
+    niche: string;
+    contentPreferences?: any;
+  },
+  partialResult: StructuredIdeaResult,
+  fallbackCtaStyle: string
+): Promise<StructuredIdeaResult> {
+  const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const sectionsSnapshot = partialResult.script
+    .map((section, index) => `${index + 1}. ${section.sectionTitle}: ${section.text || '[LIPSĂ]'}`)
+    .join('\n');
+
+  const prompt = `Completezi un răspuns JSON incomplet pentru structurarea unei idei de Reel.
+
+NIȘĂ: "${input.niche}"
+BRAND VOICE:
+${brandVoiceSection}
+STIL CTA: ${fallbackCtaStyle}
+
+IDEA UTILIZATOR:
+"""
+${input.ideaText}
+"""
+
+RĂSPUNS INCOMPLET ACTUAL:
+{
+  "mainIdea": ${JSON.stringify(partialResult.mainIdea)},
+  "hooks": ${JSON.stringify(partialResult.hooks)},
+  "script": ${JSON.stringify(partialResult.script)},
+  "cta": ${JSON.stringify(partialResult.cta)},
+  "ctaStyleApplied": ${JSON.stringify(partialResult.ctaStyleApplied)},
+  "improvements": ${JSON.stringify(partialResult.improvements)}
+}
+
+SECȚIUNI DETECTATE:
+${sectionsSnapshot}
+
+TASK:
+- Rescrie răspunsul complet în același format JSON.
+- Păstrează ideea și tonul.
+- Umple toate câmpurile lipsă sau slabe.
+- Fiecare secțiune din script trebuie să aibă 110-170 cuvinte și conținut concret.
+- Nu lăsa texte precum "string", titluri simple sau secțiuni goale.
+- Returnează exact 4 secțiuni de script și exact 4 itemi la improvements.
+
+Returnează DOAR JSON valid.`;
+
+  const content = await generateAnthropicJson(prompt, 0.35, 3200);
+  const result = await parseModelJson<StructuredIdeaResult>(content);
+  return normalizeStructuredIdeaResult(result, fallbackCtaStyle);
+}
+
+function extractTaggedValue(content: string, tag: string): string {
+  const pattern = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i');
+  const match = content.match(pattern);
+  return match?.[1]?.trim() || '';
+}
+
+function normalizeIdeaSeedText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function buildStructuredIdeaEmergencyHooks(seed: string, niche: string): string[] {
+  const compactSeed = normalizeIdeaSeedText(seed);
+  const compactNiche = normalizeIdeaSeedText(niche);
+  const focus = compactSeed.replace(/[.?!]+$/g, '');
+
+  return [
+    `De ce ${focus.toLowerCase()} contează mai mult decât crezi`,
+    `${compactNiche.split('—')[0].trim()}: ${focus.toLowerCase()}, explicat clar`,
+  ].map((hook) => hook.slice(0, 120).trim());
+}
+
+function buildStructuredIdeaEmergencyResult(input: {
+  ideaText: string;
+  niche: string;
+  contentPreferences?: any;
+}): StructuredIdeaResult {
+  const ideaSeed = normalizeIdeaSeedText(input.ideaText);
+  const nicheSeed = normalizeIdeaSeedText(input.niche);
+  const ctaStyle = input.contentPreferences?.brandVoice?.ctaStyle || 'Mix';
+  const hooks = buildStructuredIdeaEmergencyHooks(ideaSeed, nicheSeed);
+
+  return {
+    mainIdea: ideaSeed,
+    hooks,
+    script: [
+      {
+        sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[0],
+        text: `Mulți oameni din nișa ${nicheSeed} pornesc exact din punctul descris de tine: ${ideaSeed}. Problema este că ideea rămâne, de multe ori, la nivel de observație generală și nu ajunge să fie înțeleasă clar de omul care te urmărește. În partea de context trebuie să numești situația concretă, frustrarea pe care o simte persoana și motivul pentru care subiectul apare atât de des în viața ei. Așa creezi atenție și faci publicul să simtă imediat că vorbești despre realitatea lui, nu despre un sfat generic.`,
+      },
+      {
+        sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[1],
+        text: `După context, mesajul trebuie explicat simplu și logic. Pleci de la ideea ta, ${ideaSeed}, și arăți ce se întâmplă în practică, pas cu pas. Important este să explici de ce apare comportamentul respectiv, ce greșeală se repetă și ce ar trebui înțeles diferit. Fără jargon și fără propoziții vagi, partea aceasta trebuie să traducă ideea într-un limbaj clar, conversațional și util. Când omul înțelege mecanismul, nu mai percepe conținutul doar ca pe o părere, ci ca pe o explicație care îl ajută să acționeze mai bine.`,
+      },
+      {
+        sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[2],
+        text: `Ca să devină memorabil, mesajul are nevoie de un exemplu ușor de recunoscut. Poți lua o situație frecventă din nișa ${nicheSeed} și să arăți cum arată problema într-o zi normală: ce face omul, unde se blochează și de ce renunță sau repetă aceeași greșeală. Apoi legi exemplul direct de ideea ta și îi arăți ce ar schimba concret. Partea aceasta face trecerea de la teorie la aplicare și îl ajută pe urmăritor să se vadă în poveste, ceea ce crește mult claritatea și relevanța mesajului.`,
+      },
+      {
+        sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[3],
+        text: `La final, ideea trebuie închisă într-un principiu simplu și puternic. Nu repeți ce ai spus, ci formulezi concluzia într-un mod care rămâne în mintea omului: schimbarea nu vine din perfecțiune, ci din înțelegere și aplicare consecventă. Raportat la ${ideaSeed}, principiul final trebuie să transmită că progresul apare când simplifici mesajul, îl conectezi la realitatea omului și oferi o direcție clară. Asta lasă publicul cu senzația că a primit ceva util, coerent și imediat aplicabil, nu doar un text bine formulat.`,
+      },
+    ],
+    cta: `Dacă vrei, îți transform ideea într-un script complet, clar și adaptat pentru nișa ta. Trimite-mi un mesaj și plecăm exact de la subiectul acesta, ca să-l facem mai ușor de înțeles și mai ușor de pus în practică.`,
+    ctaStyleApplied: ctaStyle,
+    improvements: [...STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS],
+  };
+}
+
+async function generateStructuredIdeaTaggedFallback(
+  input: {
+    ideaText: string;
+    niche: string;
+    contentPreferences?: any;
+  },
+  fallbackCtaStyle: string
+): Promise<StructuredIdeaResult> {
+  const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const prompt = `Rescrie ideea utilizatorului ca output structurat pentru un Reel.
+
+NIȘĂ: "${input.niche}"
+BRAND VOICE:
+${brandVoiceSection}
+STIL CTA: ${fallbackCtaStyle}
+
+IDEA UTILIZATOR:
+"""
+${input.ideaText}
+"""
+
+Returnează DOAR text cu tag-urile de mai jos, fără markdown și fără explicații extra.
+- Păstrează tonul conversațional.
+- Fiecare secțiune trebuie să fie clară, completă și utilă.
+- Fiecare secțiune trebuie să aibă aproximativ 90-140 cuvinte.
+- CTA-ul trebuie să fie clar și acționabil.
+- improvements trebuie să fie exact cele 4 itemi din format.
+
+FORMAT EXACT:
+<mainIdea>...</mainIdea>
+<hook1>...</hook1>
+<hook2>...</hook2>
+<section1>...</section1>
+<section2>...</section2>
+<section3>...</section3>
+<section4>...</section4>
+<cta>...</cta>
+<ctaStyle>${fallbackCtaStyle}</ctaStyle>
+<improvements>
+Mesaj clarificat
+Redundanță eliminată
+Structură adăugată
+Ton adaptat la nișă
+</improvements>`;
+
+  const generateTaggedContent = async () => generateAnthropicText(prompt, 0.25, 2200);
+  let content: string;
+
+  try {
+    content = await generateTaggedContent();
+  } catch (error) {
+    console.warn('Structured idea tagged fallback failed on first attempt, retrying once:', error);
+    content = await generateTaggedContent();
+  }
+
+  const improvements = extractTaggedValue(content, 'improvements')
+    .split('\n')
+    .map((item) => item.replace(/^[-*]\s*/, '').trim())
+    .filter(Boolean)
+    .slice(0, 4);
+
+  return normalizeStructuredIdeaResult(
+    {
+      mainIdea: extractTaggedValue(content, 'mainIdea'),
+      hooks: [
+        extractTaggedValue(content, 'hook1'),
+        extractTaggedValue(content, 'hook2'),
+      ],
+      script: [
+        {
+          sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[0],
+          text: extractTaggedValue(content, 'section1'),
+        },
+        {
+          sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[1],
+          text: extractTaggedValue(content, 'section2'),
+        },
+        {
+          sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[2],
+          text: extractTaggedValue(content, 'section3'),
+        },
+        {
+          sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[3],
+          text: extractTaggedValue(content, 'section4'),
+        },
+      ],
+      cta: extractTaggedValue(content, 'cta'),
+      ctaStyleApplied: extractTaggedValue(content, 'ctaStyle') || fallbackCtaStyle,
+      improvements,
+    },
+    fallbackCtaStyle
+  );
+}
+
+function buildRecentIdeasSection(recentIdeas?: DailyIdeaInput['recentIdeas']): string {
+  if (!recentIdeas || recentIdeas.length === 0) {
+    return 'Nu exista idei anterioare in context.';
+  }
+
+  const compact = recentIdeas
+    .slice(0, 12)
+    .map((idea, index) => {
+      const hook = (idea.hook || '').replace(/\s+/g, ' ').trim();
+      const cta = (idea.cta || '').replace(/\s+/g, ' ').trim();
+      return `${index + 1}. [${idea.format}] Hook: "${hook}" | CTA: "${cta}"`;
+    })
+    .join('\n');
+
+  return compact;
+}
+
+function buildBrandVoiceSection(contentPreferences?: DailyIdeaInput['contentPreferences']): string {
+  const brandVoice = contentPreferences?.brandVoice;
+  if (!brandVoice) {
+    return 'Nu există Brand Voice setat.';
+  }
+
+  const list = (value: unknown) =>
+    Array.isArray(value) && value.length ? value.join(', ') : 'N/A';
+
+  return [
+    `Percepție dorită: ${list(brandVoice.perception)}`,
+    `Stil natural de vorbire: ${brandVoice.naturalStyle || 'N/A'}`,
+    `Nu vrea niciodată în content: ${list(brandVoice.neverDo)}`,
+    `Principii constante: ${list(brandVoice.principles)}${brandVoice.customPrinciple ? ` + ${brandVoice.customPrinciple}` : ''}`,
+    `Stil CTA: ${brandVoice.ctaStyle || 'N/A'}`,
+    `Cuvinte brand: ${list(brandVoice.brandWords)}`,
+    `Expresii naturale: ${brandVoice.frequentPhrases || 'N/A'}`,
+    `Nuanță umor: ${brandVoice.humorTone || 'Deloc / nesetat'}`,
+  ].join('\n');
+}
+
+function buildContentCreationSection(contentPreferences?: DailyIdeaInput['contentPreferences']): string {
+  const contentCreation = contentPreferences?.contentCreation;
+  if (!contentCreation) {
+    return 'Nu există preferințe "Cum vrei să creezi content?" setate.';
+  }
+
+  const list = (value: unknown) =>
+    Array.isArray(value) && value.length ? value.join(', ') : 'N/A';
+
+  return [
+    `Loc filmare preferat: ${contentCreation.filmingLocation || 'N/A'}`,
+    `Tipuri naturale de content: ${list(contentCreation.naturalContentTypes)}`,
+    `Alt format reprezentativ: ${contentCreation.otherNaturalFormat || 'N/A'}`,
+    `Stiluri de livrare preferate: ${list(contentCreation.deliveryStyles)}`,
+  ].join('\n');
+}
+
+const DAILY_IDEA_ADVANCED_RULES = `
+Update Prompt
+🇷🇴 ROMÂNĂ NATIVĂ, NU TRADUSĂ (CRITIC – OBLIGATORIU)
+Tot output-ul trebuie scris DIRECT în română, ca un antrenor român care vorbește cu oameni din România.
+Nu traduce idei din engleză în română.
+Nu gândi în engleză și apoi reformula.
+Nu folosi formulări care sună importate, copiate sau localizate prost.
+
+REGULI ABSOLUTE:
+- Scrie exclusiv în română naturală.
+- Folosește gramatică română corectă și firească.
+- Folosește exprimări pe care un român le-ar înțelege din prima, fără să stea să decodeze textul.
+- Dacă există o formulare simplă și românească, alege-o pe aceea în locul uneia moderne, hibride sau traduse.
+- Folosește jargon românesc de sală și de lifestyle doar când sună natural pentru România.
+- Când dai exemple, situații sau contexte, prioritizează comportamente, obiceiuri și situații reale pe care oamenii din România le recunosc imediat.
+
+EXEMPLE DE DIRECȚIE CORECTĂ:
+- vorbește ca într-o sală din România, nu ca într-un ebook american tradus
+- explică simplu, direct și familiar
+- folosește exemple pe care oamenii le recunosc în viața de zi cu zi: muncă, program haotic, mâncat pe fugă, sală, acasă, copii, ture, oboseală, lipsă de chef, „mă ia foamea seara”, „ajung rupt(ă)”, „trag de mine”
+
+EXEMPLE DE EVITAT:
+- termeni englezești băgați doar ca să pară moderni
+- structuri de tip copywriting american traduse literal
+- expresii care sună „corect” gramatical, dar nefiresc pentru română vorbită
+- jargon fitness englezesc când există o variantă clară în română
+
+TEST FINAL DE LIMBĂ:
+După fiecare hook, scenă și CTA, verifică:
+1. Sună ca româna vorbită de un antrenor român real?
+2. Ar înțelege imediat un om din România ce vrei să spui?
+3. Sună natural, nu tradus?
+4. Este corect gramatical și ușor de spus?
+Dacă NU la oricare dintre ele, rescrie.
+
+TEST FINAL DE SENS ȘI COERENȚĂ:
+După fiecare hook, scenă și CTA, verifică:
+1. Propoziția are sens complet de una singură?
+2. Este clar la ce se referă fiecare cuvânt-cheie?
+3. Evită contraste incomplete sau formulări rupte?
+4. Nu există cuvinte puse doar pentru impact, fără sens clar?
+5. Ar spune un român nativ: "da, asta are logică"?
+Dacă NU la oricare dintre ele, rescrie complet.
+
+EXEMPLU DE EVITAT:
+❌ „Îți tremură mâinile la sală? Nu e «slabă», e simplu.”
+De ce e greșit:
+- „slabă” nu are referent clar
+- propoziția nu are logică internă
+- „e simplu” nu spune nimic concret
+- sună ca o traducere stricată sau o idee neterminată
+
+EXEMPLE MAI BUNE:
+✅ „Îți tremură mâinile la sală? Problema poate fi ce faci înainte.”
+✅ „Rămâi fără energie din primele minute? Uită-te la ce faci înainte de antrenament.”
+✅ „Te ia amețeala la sală? De multe ori, problema începe înainte să intri.”
+
+REGULĂ ABSOLUTĂ:
+Nu folosi niciodată structuri de tip:
+- „nu e X, e simplu”
+- „nu e X, e altceva” fără să spui clar acel altceva
+- „nu e asta” fără concluzie clară
+- propoziții care par puternice, dar nu spun nimic concret
+
+󰐬 LIMBAJ NATIV (CRITIC – OBLIGATORIU)
+Scrie ca un antrenor român real care vorbește pe cameră.
+Nu traduce din engleză. Nu gândi în engleză.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+1⃣ GÂNDIRE DIRECT ÎN ROMÂNĂ
+Generează propozițiile ca și cum:
+- vorbești cu un client în sală
+- explici pe loc, fără să „formulezi frumos”
+❌ INTERZIS:
+- structuri care sună traduse
+- propoziții construite artificial
+- formulări „prea corecte” dar nenaturale
+Dacă propoziția pare gândită în engleză → rescrie.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+2⃣ LIMBAJ VORBIT, NU SCRIS
+Scriptul trebuie să sune ca vorbire, nu ca text.
+❌ INTERZIS:
+- formulări de tip articol / curs
+- propoziții lungi și complexe
+- explicații „prea elegante”
+✅ FOLOSEȘTE:
+- fraze scurte
+- ritm natural
+- exprimare directă
+EXEMPLU:
+❌ „Primul tău obiectiv este să îți activezi musculatura”
+✅ „Începe ușor, ca să intri în ritm”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+3⃣ FĂRĂ TRADUCERI SAU CALCHIERI
+❌ INTERZIS COMPLET:
+-
+„modul X” (modul avion, modul economie etc.)
+-
+„combo”
+-
+„te urcă și te lasă”
+-
+„intră în”
+-
+„bateria ta”
+-
+„îți pornești sistemul”
+- orice expresie care pare tradusă
+Dacă sună „ca din engleză”
+→ rescrie simplu.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+4⃣ SIMPLIFICARE FORȚATĂ
+Dacă o propoziție:
+- sună complicat
+- are prea multe cuvinte
+- pare „smart”
+→ simplific-o.
+Regulă:
+👉 dacă poate fi spus mai simplu, rescrie.
+EXEMPLU:
+❌ „corpul tău intră într-un mecanism de compensare”
+✅ „corpul începe să compenseze”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+5⃣ TEST DE SALĂ (OBLIGATORIU)
+După fiecare propoziție, verifică:
+👉 „Aș spune asta exact așa unui client, față în față?”
+Dacă răspunsul este:
+-
+„nu chiar”
+-
+„sună ciudat”
+-
+„sună prea formulat”
+→ RESCRIE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+6⃣ FĂRĂ „SUNĂ DEȘTEPT”
+❌ INTERZIS:
+- formulări care sună bine, dar nu sunt naturale
+- metafore inutile
+- exprimări creative forțate
+👉 Nu încerca să suni inteligent.
+👉 Sună clar și natural.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+7⃣ RITM DE VORBIRE REAL
+Fiecare propoziție trebuie să:
+- poată fi spusă ușor
+- nu te încurce când o citești
+- nu aibă pauze forțate
+Dacă e greu de spus → rescrie.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+🔁 REGULĂ FINALĂ (CRITICĂ):
+Pentru fiecare propoziție:
+1. Scrie varianta inițială
+2. Rescrie-o mai simplu
+3. Alege varianta care sună cel mai natural
+Nu păstra prima variantă dacă nu sună 100% real.
+💣 HOOK ENGINE (CRITIC – STOP SCROLL)
+🎯 OBIECTIV:
+Hook-ul trebuie să oprească scroll-ul în PRIMELE 1-2 secunde.
+Dacă este doar „ok”
+, nu este acceptat.
+Hook-ul trebuie să creeze reacție instant.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+1⃣ DIRECT > POLITICOS
+Hook-ul trebuie să fie direct, nu soft.
+❌ INTERZIS:
+- formulări blânde
+- întrebări neutre
+- hook-uri „safe”
+EX:
+❌ „Ajungi la sală fără chef?”
+✅ „Pierzi 10 minute în sală fără să faci nimic?”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+2⃣ CONCRET > GENERAL
+Hook-ul trebuie să fie specific.
+❌ INTERZIS:
+-
+„nu ai energie”
+-
+„nu vezi rezultate”
+-
+„nu ai chef”
+✅ FOLOSEȘTE:
+- situații clare
+EX:
+✅ „Te uiți 10 minute la aparate fără să începi?”
+✅ „Te doare spatele după fiecare antrenament?”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+3⃣ PROBLEMĂ CLARĂ (OBLIGATORIU)
+Hook-ul trebuie să atingă o problemă reală.
+Utilizatorul trebuie să spună instant:
+👉 „asta sunt eu”
+Dacă nu creează identificare → rescrie.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+4⃣ TENSIUNE / DISCONFORT (CRITIC)
+Hook-ul trebuie să creeze o mică „lovitură” mentală:
+- frustrare
+- vinovăție
+- confuzie
+- realizare
+EX:
+„Faci asta zilnic și te ține pe loc”
+„Crezi că e corect, dar te sabotează”
+Dacă nu creează reacție → rescrie.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+5⃣ CURIOSITY GAP
+Nu spune tot.
+Lasă un „gap”:
+👉 „ok… și de ce?”
+❌ INTERZIS:
+- să dai soluția în hook
+EX:
+❌ „Nu ai energie pentru că nu mănânci proteină”
+✅ „Problema nu e la antrenament. E înainte.
+”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+6⃣ FĂRĂ CLIȘEE
+❌ INTERZIS:
+-
+„nu e lene”
+-
+„nu e voință”
+-
+„uite ce faci greșit”
+-
+„probabil faci asta”
+👉 sunt supra-folosite și ignorate
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+7⃣ MAXIM 12–14 CUVINTE
+- scurt
+- rapid
+- ușor de procesat
+Dacă e lung → scade impactul
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+8⃣ STRUCTURI PERFORMANTE (OBLIGATORIU)
+Folosește UNA din aceste structuri:
+A. CONCRET + PROBLEMĂ
+„Pierzi 10 minute în sală fără să începi?”
+B. REZULTAT GREȘIT
+„Te antrenezi, dar nu vezi nimic?”
+C. CONTRAST
+„Faci asta zilnic, dar te ține pe loc”
+D. DEMONTARE
+„Nu exercițiile sunt problema”
+E. TRIGGER DIRECT
+„Te doare spatele după sală?”
+NU combina structuri.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+9⃣ LIMBAJ NATURAL (OBLIGATORIU)
+Trebuie să sune vorbit.
+❌ INTERZIS:
+- expresii traduse
+- formulări „deștepte”
+Dacă sună ca text scris → rescrie.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+9.1⃣ LIMBAJ CU SENS COMPLET (OBLIGATORIU)
+Hook-ul trebuie să aibă sens complet și clar în română.
+❌ INTERZIS:
+- cuvinte izolate fără referent clar
+- adjective fără subiect clar
+- formulări „misterioase” care nu spun nimic concret
+- propoziții care par intense, dar sunt ilogice
+✅ REGULĂ:
+Dacă hook-ul nu poate fi explicat simplu, înseamnă că nu e bun.
+Trebuie să fie clar, direct și logic din prima citire.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+🔁 REGULĂ DE RESCRIERE (CRITICĂ):
+1. Generează 3 variante de hook (intern)
+2. Alege varianta cea mai:
+- clară
+- directă
+- impactantă
+3. Dacă niciuna nu e „wow”
+→ rescrie
+NU te opri la prima variantă corectă.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+💣 TEST FINAL:
+Hook-ul trebuie să treacă testul:
+□ oprește scroll-ul?
+□ este specific?
+□ creează reacție?
+□ sună natural?
+□ nu este clișeu?
+Dacă NU → rescrie.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+🧠 REGULĂ DE IMPACT:
+Hook-ul nu trebuie să fie „frumos”
+.
+Trebuie să fie:
+- clar
+- direct
+- ușor incomod
+- real
+🚫 INTERZIS COMPLET – LIMBAJ ARTIFICIAL / TRADUS / FORȚAT
+(CRITIC)
+Scopul este ca textul să sune ca vorbire reală, naturală, spusă de un
+antrenor român pe cameră.
+Dacă o formulare pare:
+- tradusă din engleză
+- prea „deșteaptă”
+- prea creativă
+- prea scrisă
+- nefiresc de dramatică
+- metaforică fără rost
+- nenaturală pentru vorbirea din fitness în română
+→ RESCRIE-O SIMPLU.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+1⃣ NU FOLOSI EXPRESII CARE SUNĂ TRADUSE
+❌ INTERZIS:
+-
+„combo-ul care te sabotează”
+-
+„modul X”
+-
+„modul avion”
+-
+„economy mode”
+-
+„bateria ta”
+-
+„îți pornești sistemul”
+-
+„te urcă și te lasă”
+-
+„intră în modul...
+”
+-
+„gaura de energie”
+-
+„starter stabil”
+-
+„micro-pauză de energie”
+-
+„blocaj de start”
+-
+„disciplina calmă”
+-
+-
+-
+-
+-
+„pe avarie”
+„îți aprinde energia”
+„îți pornește corpul”
+„îți activezi sistemul”
+„îți resetezi corpul” dacă sună forțat
+✅ ÎNLOCUIEȘTE CU:
+-
+„problema e aici”
+-
+„aici greșești”
+-
+„de asta te simți așa”
+-
+„începe ușor”
+-
+„mișcă-te puțin înainte”
+-
+„intri mai ușor în antrenament”
+-
+„îți revii mai repede”
+-
+„te simți mai ok”
+-
+„îți e mai ușor să începi”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+2⃣ NU FOLOSI METAFORĂ DACĂ POȚI SPUNE DIRECT
+Regulă:
+Dacă ideea poate fi spusă simplu și direct, NU folosi metaforă.
+❌ INTERZIS:
+-
+„corpul intră pe scurtătură”
+-
+„spatele fură mișcarea”
+-
+„creierul zice mai bine stau”
+-
+„corpul e în modul șezut”
+-
+„energia cade în gol”
+-
+„te lovește somnul” dacă sună teatral
+-
+„îți moare antrenamentul înainte să înceapă”
+-
+„intri pe pilot automat” dacă e forțat
+✅ MAI BUN:
+-
+„corpul începe să compenseze”
+-
+-
+-
+-
+-
+„simți mai mult spatele decât fesierii”
+„amâni să începi”
+„te miști greu la început”
+„ți se face somn”
+„nu ai chef să începi”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+3⃣ NU SCRIE CA ÎNTR-UN ARTICOL
+Textul nu trebuie să sune ca:
+- blog
+- curs
+- ebook
+- material educațional scris
+❌ INTERZIS:
+-
+„ce se întâmplă practic”
+-
+„următoarea etapă”
+-
+„acest proces”
+-
+„obiectivul principal”
+-
+„mecanismul din spate”
+-
+„factor determinant”
+-
+„în acest context”
+-
+„în majoritatea cazurilor”
+-
+„în mod frecvent”
+-
+„de multe ori” repetat excesiv
+-
+„în mod ideal”
+✅ FOLOSEȘTE:
+-
+„uite unde e problema”
+-
+„aici greșești”
+-
+„de asta se întâmplă”
+-
+„fă asta în schimb”
+-
+„uite cum o rezolvi”
+-
+„începe așa”
+-
+-
+„mai simplu de atât”
+„asta te ajută pentru că...
+”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+4⃣ NU ÎNCERCA SĂ SUNI „SMART”
+Dacă o propoziție sună:
+- prea formulată
+- prea elegantă
+- prea „copywriter”
+- prea construită
+→ simplific-o imediat.
+❌ INTERZIS:
+- formulări care impresionează, dar nu sună real
+- jocuri de cuvinte inutile
+- expresii pseudo-motivaționale
+- contraste dramatice artificiale
+EXEMPLE PROASTE:
+-
+„nu te pedepsești, te repoziționezi”
+-
+„variat e viața ta, nu planul”
+-
+„nu negocia 30 de minute cu tine”
+-
+„cheia e să intri în ritm metabolic”
+-
+„pornește-ți corpul”
+-
+„rescrie-ți startul”
+✅ EXEMPLE BUNE:
+-
+„nu intra direct în cel mai greu exercițiu”
+-
+„începe cu ceva simplu”
+-
+„fă primul pas ușor”
+-
+„nu complica”
+-
+„ține-l simplu”
+-
+„așa îți e mai ușor să continui”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+5⃣ NU FOLOSI DRAMATIZARE FORȚATĂ
+Hook-urile și scripturile pot fi directe și puternice, dar nu teatrale.
+❌ INTERZIS:
+-
+„ghici cine se plânge după?”
+-
+„și de aici începe dezastrul”
+-
+„asta te distruge”
+-
+„asta te sabotează” folosit excesiv
+-
+„normal că ești terminată”
+-
+„îți cade tot”
+-
+„corpul tău cedează”
+-
+„intră în panică”
+-
+„ești pe modul supraviețuire” dacă sună tradus
+✅ MAI BUN:
+-
+„de asta ajungi să simți spatele”
+-
+„de asta ți se pare totul mai greu”
+-
+„de asta pornești prost antrenamentul”
+-
+„de asta nu ai energie”
+-
+„de asta nu simți exercițiul unde trebuie”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+6⃣ NU FOLOSI ROMGLEZĂ SAU FORMULĂRI HIBRIDE DUBIOASE
+❌ INTERZIS:
+- combinații română-engleză care nu sunt naturale
+- termeni englezești băgați doar ca să sune modern
+- formulări hibride gen „start ritual”
+, „reset protocol”
+, „energy drop”
+, dacă
+nu sunt absolut necesare
+✅ REGULĂ:
+Dacă există o variantă simplă și naturală în română, folosește-o.
+Ex:
+❌ „start ritual”
+✅ „o rutină simplă de început”
+❌ „reset”
+✅ „un start simplu” / „o rutină scurtă”
+❌ „energy crash”
+✅ „cădere de energie” / „ți se taie energia”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+7⃣ TEST DE NATURALEȚE (OBLIGATORIU)
+După fiecare hook și fiecare propoziție importantă, verifică:
+- Aș auzi un antrenor român spunând asta exact așa?
+- Sună ca vorbire reală?
+- Sună simplu și direct?
+- E clar din prima?
+- Are sens fără să o recitesc?
+Dacă răspunsul este NU la oricare dintre ele → RESCRIE.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+8⃣ REGULĂ DE RESCRIERE SIMPLĂ
+Dacă o propoziție sună artificial, rescrie-o astfel:
+Pas 1: scoate metafora
+Pas 2: scoate dramatizarea
+Pas 3: scoate orice cuvânt „smart”
+Pas 4: spune ideea cât mai simplu, ca pentru un client
+Exemplu:
+❌ „Combo-ul care te sabotează îți omoară energia înainte de sală.
+”
+✅ „Problema e ce faci înainte de sală.
+”
+❌ „Corpul intră pe scurtătură și lombarul preia controlul.
+”
+✅ „Corpul începe să compenseze și simți mai mult spatele.
+”
+❌ „Ai bateria la 3% și intri pe economy mode.
+”
+✅ „Ești obosită și îți e greu să începi.
+”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+9⃣ REGULĂ FINALĂ
+Mai bine simplu și foarte natural
+decât creativ și ciudat.
+Mai bine direct
+decât „deștept”
+.
+Mai bine clar
+decât memorabil forțat.
+🗣 FILTRU FINAL DE UMANITATE (CRITIC – OBLIGATORIU)
+Tot output-ul trebuie să sune ca vorbire reală.
+Scrie ca și cum:
+- vorbești direct cu un client
+- în sală sau pe cameră
+- spontan, clar și natural
+- fără să încerci să „scrii frumos”
+Scopul NU este să sune impresionant.
+Scopul este să sune uman, firesc și ușor de spus.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+1⃣ TESTUL DE VORBIRE REALĂ
+Fiecare hook, scenă și CTA trebuie să treacă testul:
+👉 „Aș putea spune asta exact așa, cu voce tare, unui client real?”
+Dacă răspunsul este:
+-
+„sună puțin scris”
+-
+„sună prea formulat”
+-
+„sună prea explicat”
+-
+„sună ca text, nu ca vorbire”
+→ RESCRIE
+Nu livra nicio propoziție care sună bine doar pe ecran, dar prost când e
+spusă.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+2⃣ SUNĂ CA OM, NU CA TEXT
+Output-ul trebuie să sune ca un om care vorbește, nu ca un text
+redactat.
+❌ INTERZIS:
+- formulări de tip articol
+- explicații prea ordonate și rigide
+- propoziții „perfect construite”
+, dar nenaturale
+- fraze care par scrise pentru citit, nu pentru vorbit
+✅ FOLOSEȘTE:
+- fraze care curg natural
+- exprimare simplă
+- propoziții scurte sau medii
+- ton cald, direct, natural
+EXEMPLU:
+❌ „Obiectivul acestei rutine este să optimizeze intrarea în
+antrenament.
+”
+✅ „Scopul e simplu: să-ți fie mai ușor să începi.
+”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+3⃣ FĂRĂ VOCE DE ARTICOL / CURS / EBOOK
+Dacă textul sună ca:
+- articol de blog
+- PDF
+- material educațional scris
+- curs
+- text explicativ lung
+- caption prea redactat
+→ RESCRIE
+❌ INTERZIS:
+-
+„în acest context”
+-
+„obiectivul principal”
+-
+„mecanismul din spate”
+-
+„următoarea etapă”
+-
+„acest proces”
+-
+„în majoritatea cazurilor”
+-
+„este important să”
+-
+-
+„se recomandă”
+„în mod ideal”
+✅ MAI UMAN:
+-
+„uite unde e problema”
+-
+„aici greșești”
+-
+„de asta ți se întâmplă”
+-
+„fă asta în schimb”
+-
+„mai simplu”
+-
+„începe așa”
+-
+„asta te ajută pentru că…
+”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+4⃣ FĂRĂ EXPLICAȚII LUNGI SAU GREOAIE
+Dacă o propoziție are:
+- prea multe idei
+- prea multe detalii
+- prea multe paranteze mentale
+- prea multe explicații într-o singură frază
+→ RUPE-O sau SIMPLIFIC-O
+Regulă:
+O propoziție bună trebuie să fie înțeleasă din prima, fără recitire.
+❌ INTERZIS:
+- fraze lungi care par „bine scrise”
+, dar greu de urmărit
+- propoziții încărcate cu explicații tehnice + exemple + justificări
+✅ FOLOSEȘTE:
+- 1 idee clară per propoziție
+- 1 direcție clară per scenă
+- explicație simplă, apoi exemplu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+5⃣ TESTUL DE SALĂ (OBLIGATORIU)
+Imaginează-ți că ești:
+- lângă aparat
+- între 2 seturi
+- sau filmezi un Reel rapid
+Întreabă-te:
+👉 „Aș spune asta așa, natural, fără să mă opresc?”
+Dacă nu, rescrie până sună natural.
+Textul trebuie să sune ca o explicație pe care o dai repede și clar, nu ca
+una pregătită pentru citit.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+6⃣ FĂRĂ SUNET DE AI SAU COPYWRITER
+Dacă textul sună:
+- prea „smart”
+- prea bine ambalat
+- prea dramatic
+- prea metaforic
+- prea perfect
+→ RESCRIE
+❌ INTERZIS:
+- formulări care vor să impresioneze
+- expresii pseudo-profonde
+- propoziții care „sună bine”
+, dar nu ar fi spuse real
+- jocuri de cuvinte inutile
+- contraste artificiale
+✅ PREFERĂ:
+- clar
+- direct
+- simplu
+- uman
+- util
+Regulă:
+Mai bine puțin mai simplu decât puțin prea „scris”
+.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+7⃣ RITM DE VORBIRE NATURAL
+Output-ul trebuie să aibă ritm de vorbire real.
+Asta înseamnă:
+- curge natural
+- nu sare brusc între idei
+- nu pare listă
+- nu pare rigid
+- nu se împiedică în formulare
+Dacă textul pare:
+- prea compact
+- prea grăbit
+- prea explicativ
+- prea tăios fără flow
+→ rescrie
+Scriptul trebuie să se simtă ca o conversație scurtă, nu ca o schemă
+tehnică.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+8⃣ UMAN > PERFECT
+Nu încerca să sune „perfect”
+.
+Încearcă să sune REAL.
+Un antrenor real:
+- nu vorbește ca într-un manual
+- nu explică excesiv
+- nu alege mereu formularea cea mai elegantă
+- spune lucrurile simplu și clar
+Preferă:
+- vorbire reală
+- exprimare firească
+- formulări pe care le-ai folosi spontan
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+9⃣ TESTUL DE NATURALEȚE (OBLIGATORIU)
+După ce generezi textul, verifică pentru fiecare parte:
+□ Sună ca și cum e spusă, nu scrisă?
+□ Ai auzi un antrenor român spunând asta exact așa?
+□ Se înțelege din prima?
+□ Curge natural când o citești cu voce tare?
+□ E suficient de simplă?
+□ Nu pare articol, caption sau ebook?
+□ Nu pare prea „deșteaptă” sau prea formulată?
+Dacă NU la oricare → RESCRIE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━
+🔁 REGULĂ FINALĂ DE RESCRIERE
+Pentru fiecare hook, scenă și CTA:
+1. Scrie varianta inițială
+2. Citește-o mental ca și cum ar fi spusă cu voce tare
+3. Taie tot ce sună:
+- prea scris
+- prea lung
+- prea elegant
+- prea explicativ
+4. Rescrie-o mai simplu
+5. Păstrează varianta cea mai umană
+Nu livra varianta care sună „bine scris”
+.
+Livrează varianta care sună cel mai uman.
+Dacă textul sună bine ca scris, dar prost ca vorbit, nu este bun.
+Natural > elegant
+Uman > perfect
+Vorbit > redactat
+Clar > impresionant
+`;
+
+export async function generateDailyIdea(input: DailyIdeaInput): Promise<DailyIdeaResult> {
+  const objective = input.objective || 'lead-gen';
+  const recentIdeasSection = buildRecentIdeasSection(input.recentIdeas);
+  const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const contentCreationSection = buildContentCreationSection(input.contentPreferences);
+  const icpProfileText =
+    input.icpProfile == null
+      ? 'Nu există profil de client ideal salvat. Folosește exclusiv nișa pentru specificitate și nu inventa detalii foarte precise despre client.'
+      : typeof input.icpProfile === 'string'
+        ? input.icpProfile
+        : JSON.stringify(input.icpProfile);
+  
+  const prompt = `Tu ești un expert în content marketing fitness cu focus pe conversii reale.
+
+TOT OUTPUT-UL TREBUIE SĂ FIE EXCLUSIV ÎN ROMÂNĂ NATURALĂ, CORECTĂ GRAMATICAL ȘI UȘOR DE ÎNȚELES PENTRU OAMENI DIN ROMÂNIA.
+NU traduce din engleză. NU folosi jargon englezesc dacă există variantă clară în română. Scrie ca un antrenor român real, pentru public român.
+
+CONTEXT CLIENT (CITEȘTE CU ATENȚIE - TOATE IDEILE TREBUIE SĂ FIE DESPRE ACEASTĂ NIȘĂ):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📍 NIȘA EXACTĂ: "${input.niche}"
+👤 CLIENT IDEAL: ${icpProfileText}
+🎯 OBIECTIV: ${objective === 'lead-gen' ? 'generare lead-uri prin DM' : objective}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BRAND VOICE (OBLIGATORIU - SCRIPTUL TREBUIE SĂ SUNE CA ANTRENORUL):
+${brandVoiceSection}
+
+PREFERINȚE "CUM VREI SĂ CREEZI CONTENT?" (CONTEXT GLOBAL):
+${contentCreationSection}
+
+REGULI DE APLICARE PENTRU PREFERINȚELE DE CREARE CONTENT:
+1. Dacă există preferințe de filmare/livrare, adaptează ideea la ele.
+2. Când propui scene/visual-uri, prioritizează contextul de filmare selectat.
+3. Formatele și stilul de exprimare trebuie să țină cont de ce îi vine natural creatorului.
+4. Dacă există "Mix, în funcție de zi", poți combina stilurile, dar păstrează coerența.
+
+REGULI BRAND VOICE (OBLIGATORIU):
+1. Tonul, formulările și energia trebuie să respecte Brand Voice-ul de mai sus.
+2. Evită explicit stilurile marcate la "Nu vrea niciodată în content".
+3. Folosește natural 1-2 expresii din lista antrenorului (dacă există).
+4. CTA-ul trebuie să respecte stilul CTA selectat.
+5. Umorul (dacă apare) respectă nuanța setată.
+
+REGULI AVANSATE HOOK + SCRIPT + CTA (OBLIGATORIU):
+${DAILY_IDEA_ADVANCED_RULES}
+
+🔵 REGULA CORECTĂ
+Exercițiile recomandate trebuie să fie corecte tehnic și adaptate specific la ideea generată, potrivite pentru nivelul, contextul și limitările definite de nișă.
+
+⚠️ IMPORTANT - CITEȘTE ÎNAINTE DE A GENERA:
+Această idee TREBUIE să fie 100% specifică nisei: "${input.niche}"
+NU genera content generic despre fitness/slăbit - vorbește EXACT despre nișa de mai sus!
+
+ISTORIC IDEI RECENTE (TREBUIE EVITATE REPETIȚIILE):
+${recentIdeasSection}
+
+REGULI DE UNICITATE (OBLIGATORIU):
+1. Propune o idee cu unghi NOU față de istoricul de mai sus.
+2. NU reutiliza hook-uri, teme, structuri narative sau CTA-uri similare cu ideile recente.
+3. Dacă observi pattern-uri repetitive în istoric, schimbă explicit:
+   - mecanismul/problema abordată
+   - promisiunea principală
+   - tipul de exemplu practic
+4. Ideea trebuie să fie distinctă semantic, nu doar reformulată.
+
+Generează o idee completă de postare Instagram/TikTok care:
+1. Hook-ul TREBUIE să menționeze direct problema/audiența din nișă (ex: pentru "mame după sarcină" → hook despre mame, nu generic)
+2. Script-ul rezolvă PROBLEMA SPECIFICĂ a clientului ideal descris mai sus
+3. CTA-ul oferă un lead magnet RELEVANT pentru nișă
+4. Fiecare scenă vorbește DIRECT către clientul ideal
+5. Evită orice generalizări - fii SPECIFIC și TARGETAT
+
+REGULI STRICTE:
+✗ NU folosi hook-uri generice ("Vrei să slăbești?", "3 trucuri pentru...")
+✓ Folosește hook-uri specifice nisei ("Mamă după sarcină? Acestea sunt greșelile care te blochează...")
+✗ NU oferi sfaturi generale de fitness
+✓ Oferă soluții EXACTE pentru problema clientului ideal
+✗ NU crea lead magnets generice
+✓ Creează lead magnets care rezolvă EXACT problema nisei
+
+Format: Alege între REEL (30-60 sec, 4-6 scene), CAROUSEL (6-9 slide-uri) sau STORY (15 sec, 3-4 scene).
+
+REGULĂ LINGVISTICĂ FINALĂ:
+- hook-ul, scriptul, CTA-ul, lead magnetul și reasoning-ul trebuie să fie în română nativă
+- fără romgleză inutilă
+- fără traduceri literale
+- fără formulări care sună „americanizate”
+- fără expresii care ar confuza un public român
+- dacă o formulare nu ar fi spusă natural într-o conversație reală în România, rescrie-o
+- dacă un hook nu are sens complet de unul singur, rescrie-l
+- dacă o propoziție pare „puternică”, dar nu spune clar ceva concret, rescrie-o
+- claritatea și logica sunt obligatorii, nu opționale
+
+IMPORTANT PENTRU SCRIPT - CERINȚE DETALIATE:
+- Pentru fiecare scenă/slide, câmpul "text" trebuie să fie FOARTE DETALIAT și COMPLET
+- Minim 4-6 propoziții per scenă (≈ 80-150 de cuvinte), în română naturală și conversațională
+- Include:
+  * Tranziții naturale ("Acum să-ți arăt...", "Uite ce se întâmplă...", "De ce funcționează?", "Hai să vorbim despre...")
+  * Exemple SPECIFICE și CONCRETE din nișă (nu generalizări)
+  * Detalii tehnice relevante (ex: "30 de minute dimineața, înainte de cafea")
+  * Storytelling elements (metafore, comparații, micro-story)
+  * Pain points și soluții explicite
+- Pentru REEL: 5-7 scene (nu 4-6)
+- Pentru CAROUSEL: 8-10 slide-uri (nu 6-9)
+- Reasoning: 4-5 propoziții DETALIATE cu psihologie și strategie marketing
+
+Răspunde DOAR în format JSON strict, fără markdown.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Fără newline-uri literale în valorile string; folosește \\n doar dacă este necesar
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "format": "REEL",
+  "hook": "Hook vizual scurt, foarte natural și SPECIFIC (ideal 8-14 cuvinte, maxim 16)",
+  "script": [
+    {"scene": 1, "text": "Text DETALIAT cu 4-6 propoziții (80-150 cuvinte) - include context, tranziții, exemple specifice, storytelling", "visual": "Cadru/visual concret și descriptiv"},
+    {"scene": 2, "text": "Text DETALIAT cu 4-6 propoziții (80-150 cuvinte) - include detalii tehnice, pain points, soluții clare", "visual": "Cadru/visual concret și descriptiv"},
+    {"scene": 3, "text": "Text DETALIAT cu 4-6 propoziții (80-150 cuvinte)", "visual": "Visual"}
+  ],
+  "cta": "CTA direct, scurt și conversațional cu keyword DM + beneficiu simplu și clar",
+  "objective": "Generare lead-uri",
+  "conversionRate": 45.5,
+  "leadMagnet": "Lead magnet FOARTE specific și detaliat pentru nișă (descrie EXACT ce primește)",
+  "dmKeyword": "Keyword-ul din DM",
+  "reasoning": "De ce funcționează această idee - 4-5 propoziții DETALIATE, scrise în română clară și naturală, care explică psihologia, pattern-urile de conversie, și de ce rezonează cu ICP-ul specific"
+}`;
+
+  console.log(`🎯 Generating idea for niche: "${input.niche}"`);
+  console.log(`👤 ICP: ${icpProfileText.substring(0, 100)}...`);
+
+  const content = await generateAnthropicJson(prompt, 0.8, 3500);
+  console.log(`✅ Anthropic response received (${content.length} chars)`);
+  const result = await parseModelJson<DailyIdeaResult>(content);
+  
+  console.log(`📝 Generated idea - Format: ${result.format}, Hook: "${result.hook.substring(0, 50)}..."`);
+  
+  return result;
+}
+
+export async function generateMultiFormatIdea(input: DailyIdeaInput): Promise<MultiFormatIdeaResult> {
+  const objective = input.objective || 'lead-gen';
+  const isGeneralIdea = input.general === true;
+  const recentIdeasSection = buildRecentIdeasSection(input.recentIdeas);
+  const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const contentCreationSection = buildContentCreationSection(input.contentPreferences);
+  const icpProfileText =
+    input.icpProfile == null
+      ? 'Nu există profil de client ideal salvat. Folosește exclusiv nișa pentru specificitate și nu inventa detalii foarte precise despre client.'
+      : typeof input.icpProfile === 'string'
+        ? input.icpProfile
+        : JSON.stringify(input.icpProfile);
+  
+  const prompt = `Tu ești un expert în content marketing fitness cu focus pe conversii reale.
+
+TOT OUTPUT-UL TREBUIE SĂ FIE EXCLUSIV ÎN ROMÂNĂ NATURALĂ, CORECTĂ GRAMATICAL ȘI UȘOR DE ÎNȚELES PENTRU OAMENI DIN ROMÂNIA.
+NU traduce din engleză. NU folosi jargon englezesc dacă există variantă clară în română. Scrie ca un antrenor român real, pentru public român.
+
+CONTEXT CLIENT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📍 MOD: ${isGeneralIdea ? 'idee generală, fără nișă specifică' : 'idee bazată pe nișă'}
+📍 CONTEXT PRINCIPAL: "${input.niche}"
+👤 CLIENT IDEAL: ${isGeneralIdea ? 'Public larg din România interesat de fitness, slăbire sustenabilă, energie mai bună și obiceiuri sănătoase.' : icpProfileText}
+🎯 OBIECTIV: ${objective === 'lead-gen' ? 'generare lead-uri prin DM' : objective}
+
+BRAND VOICE (OBLIGATORIU):
+${brandVoiceSection}
+
+PREFERINȚE "CUM VREI SĂ CREEZI CONTENT?" (CONTEXT GLOBAL):
+${contentCreationSection}
+
+REGULI DE APLICARE PENTRU PREFERINȚELE DE CREARE CONTENT:
+- Dacă există preferințe de filmare/livrare, adaptează toate cele 3 idei la ele.
+- Când propui scene/visual-uri, prioritizează contextul de filmare selectat.
+- Formatele și stilul de exprimare trebuie să țină cont de ce îi vine natural creatorului.
+- Dacă există "Mix, în funcție de zi", poți combina stilurile, dar păstrează coerența.
+
+REGULI BRAND VOICE (OBLIGATORIU):
+- Toate cele 3 idei trebuie să sune ca același antrenor (același ton și vocabular).
+- Respectă explicit ce NU vrea în content.
+- CTA-urile trebuie să respecte stilul CTA ales.
+- Folosește expresii naturale furnizate (dacă există), fără a forța repetiția.
+- Umorul (dacă apare) respectă nuanța aleasă.
+
+REGULI AVANSATE HOOK + SCRIPT + CTA (OBLIGATORIU):
+${DAILY_IDEA_ADVANCED_RULES}
+
+🔵 REGULA CORECTĂ
+Exercițiile recomandate trebuie să fie corecte tehnic și adaptate specific la ideea generată, potrivite pentru nivelul, contextul și limitările publicului țintă.
+
+ISTORIC IDEI RECENTE (EVITĂ REUTILIZAREA):
+${recentIdeasSection}
+
+REGULI DE UNICITATE (OBLIGATORIU):
+- Cele 3 idei (REEL/CAROUSEL/STORY) trebuie să fie unice între ele.
+- Fiecare idee trebuie să fie unică și față de istoricul recent.
+- NU reutiliza hook-uri, CTA-uri, cadre narative sau aceeași problemă principală.
+- Evită parafrazări: diferența trebuie să fie de concept, nu doar de wording.
+
+Generează 3 IDEI COMPLET DIFERITE (TEME DIFERITE, NU DOAR FORMATE DIFERITE):
+
+**REEL**: Alege UN subiect (ex: greșeala comună, mit demontant, hack rapid)
+**CAROUSEL**: Alege ALT subiect diferit (ex: plan 7 zile, before/after, checklist)
+**STORY**: Alege AL TREILEA subiect diferit (ex: motivație, reminder urgent, quick tip)
+
+🚨 CRITICI: Dacă REEL vorbește despre "greșeli la micul dejun", CAROUSEL trebuie despre ALT SUBIECT complet (ex: "5 exerciții pentru acasă"), NU despre micul dejun!
+
+Formatul fiecăruia:
+
+1. **REEL (30-90 sec, 3-6 scene)** - Subiectul 1
+   - Hook dinamic, vizual puternic (MAX 20 cuvinte)
+   - Script total: 120-220 cuvinte
+   - Structură OBLIGATORIE: HOOK → 3-6 secțiuni tematice → CTA final
+   - FIECARE SECȚIUNE: 25-45 cuvinte
+   - Perfect pentru: viral potential, educație densă și practică
+   
+   🎯 CERINȚE CALITATE SCRIPT REEL:
+   ✅ Fiecare secțiune trebuie să DEZVOLTE logic ideea (nu doar afirmații)
+   ✅ Include explicații concrete: DE CE? CUM? CE ÎNSEAMNĂ PRACTIC?
+   ✅ Cel puțin UN exemplu concret sau situație reală
+   ✅ Progresie logică între secțiuni
+   ✅ Limbaj conversațional, nu academic
+   ✅ FILMABIL IMEDIAT fără pregătire suplimentară
+   
+   ❌ INTERZIS:
+   ❌ Afirmații tip "este important să..." fără explicație
+   ❌ Fraze scurte fără dezvoltare
+   ❌ Idei comprimate în 1-2 propoziții superficiale
+   ❌ Repetarea aceleiași idei în formulări diferite
+   ❌ Limbaj teoretic sau generic
+
+2. **CAROUSEL (8-12 slide-uri)** - Subiectul 2 (DIFERIT!)
+   - Hook intrigant
+   - Fiecare slide = un pas/idee DETALIAT
+   - Perfect pentru: liste, pași, comparații, ghiduri
+   - FIECARE SLIDE: 4-5 propoziții (70-120 cuvinte)
+
+3. **STORY (20-30 sec, 4-6 scene)** - Subiectul 3 (DIFERIT!)
+   - Hook INSTANT
+   - Message concentrat dar COMPLET
+   - Perfect pentru: urgență, reminder rapid, tips
+   - FIECARE SCENĂ: 2-4 propoziții (40-80 cuvinte)
+
+⚠️ IMPORTANT - CERINȚE DETALIERE:
+- Cele 3 idei trebuie să aibă TEME/SUBIECTE DIFERITE între ele
+- Fiecare adaptată la platforma sa (REEL = energic + detaliat, CAROUSEL = foarte detaliat, STORY = scurt dar complet)
+- ${isGeneralIdea ? 'Toate trebuie să fie relevante pentru public fitness general din România, fără să presupună o nișă specifică.' : `Toate 100% specifice nisei: "${input.niche}"`}
+- Toate 100% în română nativă, naturală și clară pentru publicul din România
+- Fără romgleză inutilă, fără traduceri literale, fără expresii confuze sau importate artificial
+
+🔥 REGULI CRITICE PENTRU SCRIPTUL REEL:
+
+📏 LUNGIME TOTALĂ: 120-220 cuvinte (fără hook și CTA)
+⏱️ DURATĂ ESTIMATĂ: 30-90 secunde
+📊 STRUCTURĂ OBLIGATORIE: Hook (max 20 cuv) → 3-6 secțiuni (25-45 cuv fiecare) → CTA contextual
+
+✅ FIECARE SECȚIUNE TREBUIE SĂ:
+- Dezvolte ideea LOGIC (nu doar afirmații goale)
+- Răspundă implicit la: DE CE? CUM? CE ÎNSEAMNĂ CONCRET?
+- Includă explicații complete, nu superficiale
+- Conțină cel puțin UN exemplu concret sau situație reală
+- Fie filmabilă IMEDIAT fără pregătire suplimentară
+- Aibă progresie logică față de secțiunea anterioară
+
+❌ ABSOLUT INTERZIS:
+- Afirmații de tip "este important să..." fără explicație
+- Limbaj academic sau teoretic
+- Fraze scurte fără dezvoltare (doar 1-2 propoziții superficiale)
+- Repetarea aceleiași idei în formulări diferite
+- Generalități fără exemple concrete
+- Scripturi care necesită completări sau explicații suplimentare
+
+🎬 CALITATE > CREATIVITATE VAGĂ
+Scriptul trebuie să pară scris de un antrenor REAL, nu de un AI generic.
+Limbaj conversațional, ritm natural, coerență totală.
+
+📋 CHECKLIST VALIDARE ÎNAINTE DE A RĂSPUNDE:
+□ Script REEL: 120-220 cuvinte total (fără hook/CTA) ✓
+□ Fiecare secțiune: 25-45 cuvinte ✓
+□ Include minimum 1 exemplu concret în script ✓
+□ Progresie logică între toate secțiunile ✓
+□ Filmabil imediat, fără completări necesare ✓
+□ Zero afirmații goale sau limbaj teoretic ✓
+□ Fiecare secțiune răspunde la: DE CE? CUM? CE ÎNSEAMNĂ PRACTIC? ✓
+□ Hook-ul are sens complet și logic în română ✓
+□ Nicio propoziție nu sună ambiguă, ruptă sau tradusă prost ✓
+
+Răspunde DOAR în format JSON strict, fără markdown.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Fără newline-uri literale în valorile string; folosește \\n doar dacă este necesar
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "reel": {
+    "format": "REEL",
+    "hook": "Hook dinamic pentru REEL, foarte natural și specific (ideal 8-14 cuvinte, maxim 16)",
+    "script": [
+      {"scene": 1, "text": "SECȚIUNE 1 (25-45 cuvinte): Dezvoltă logic ideea + explică DE CE + include context concret din nișă. NU doar afirmații. Trebuie să răspundă: ce înseamnă practic? Exemplu real sau situație specifică OBLIGATORIU.", "visual": "Visual/cadru descriptiv și specific"},
+      {"scene": 2, "text": "SECȚIUNE 2 (25-45 cuvinte): Continuă progresiv ideea + explică CUM funcționează + detalii tehnice concrete (timpi/cantități/pași). Nu teoretic, ci practic și filmabil imediat.", "visual": "Visual/cadru descriptiv"},
+      {"scene": 3, "text": "SECȚIUNE 3 (25-45 cuvinte): Dezvoltă următoarea idee logic + răspunde la DE CE contează + include tranziție naturală. Limbaj conversațional, nu academic.", "visual": "Visual descriptiv"},
+      {"scene": 4, "text": "SECȚIUNE 4 (25-45 cuvinte, OPȚIONAL): Dacă necesară pentru completitudine - aprofundează soluția + include detalii practice + evită repetări.", "visual": "Visual descriptiv"}
+    ],
+    "cta": "CTA REEL contextual, direct și conversațional + keyword DM + beneficiu simplu și clar",
+    "objective": "Generare lead-uri",
+    "conversionRate": 45.5,
+    "leadMagnet": "Lead magnet FOARTE specific și detaliat - descrie EXACT ce primește (ex: 'Ghid PDF de 15 pagini cu 21 de rețete pentru micul dejun + plan de antrenament 3x/săptămână adaptat pentru acasă')",
+    "dmKeyword": "KEYWORD",
+    "reasoning": "De ce funcționează REEL-ul - 4-5 propoziții DETALIATE, în română clară și naturală, cu psihologie, pattern-uri de conversie, și de ce rezonează cu ICP-ul. Explică progresiunea logică a scriptului."
+  },
+  "carousel": {
+    "format": "CAROUSEL",
+    "hook": "Hook pentru CAROUSEL, foarte natural și specific (ideal 8-14 cuvinte, maxim 16)",
+    "script": [
+      {"scene": 1, "text": "Slide 1 DETALIAT: 4-5 propoziții (70-120 cuvinte) - introducere completă cu context și hook explanation", "visual": "Visual slide descriptiv"},
+      {"scene": 2, "text": "Slide 2 DETALIAT: 4-5 propoziții - pas/idee 1 explicat în detaliu cu exemple", "visual": "Visual slide"},
+      {"scene": 3, "text": "Slide 3 DETALIAT: 4-5 propoziții", "visual": "Visual"},
+      {"scene": 4, "text": "Slide 4 DETALIAT: 4-5 propoziții", "visual": "Visual"},
+      {"scene": 5, "text": "Slide 5 DETALIAT: 4-5 propoziții", "visual": "Visual"},
+      {"scene": 6, "text": "Slide 6 DETALIAT: 4-5 propoziții", "visual": "Visual"},
+      {"scene": 7, "text": "Slide 7 DETALIAT: 4-5 propoziții", "visual": "Visual"},
+      {"scene": 8, "text": "Slide 8 DETALIAT: 4-5 propoziții - concluzie și CTA", "visual": "Visual"}
+    ],
+    "cta": "CTA CAROUSEL direct și clar cu keyword DM + beneficiu simplu și relevant",
+    "objective": "Generare lead-uri",
+    "conversionRate": 42.0,
+    "leadMagnet": "Lead magnet FOARTE specific și detaliat cu descriere completă a conținutului",
+    "dmKeyword": "KEYWORD",
+    "reasoning": "De ce funcționează CAROUSEL-ul - 4-5 propoziții DETALIATE, în română clară și naturală"
+  },
+  "story": {
+    "format": "STORY",
+    "hook": "Hook urgent pentru STORY, natural și specific (ideal 8-14 cuvinte, maxim 16)",
+    "script": [
+      {"scene": 1, "text": "Text COMPLET 2-4 propoziții (40-80 cuvinte) - hook explanation + context", "visual": "Visual descriptiv"},
+      {"scene": 2, "text": "Text COMPLET 2-4 propoziții - problema/soluția explicată", "visual": "Visual"},
+      {"scene": 3, "text": "Text COMPLET 2-4 propoziții", "visual": "Visual"},
+      {"scene": 4, "text": "Text COMPLET 2-4 propoziții - CTA și urgență", "visual": "Visual"}
+    ],
+    "cta": "CTA STORY direct și urgent, cu keyword DM + beneficiu clar și simplu",
+    "objective": "Generare lead-uri",
+    "conversionRate": 38.0,
+    "leadMagnet": "Lead magnet relevant și detaliat",
+    "dmKeyword": "KEYWORD",
+    "reasoning": "De ce funcționează STORY-ul - 4-5 propoziții DETALIATE, în română clară și naturală"
+  }
+}`;
+
+  console.log(`🎯 Generating multi-format ideas for niche: "${input.niche}"`);
+
+  const parseResponse = async () => {
+    const content = await generateAnthropicJson(prompt, 0.8, 6000);
+    console.log(`✅ Anthropic multi-format response received (${content.length} chars)`);
+    return parseModelJson<MultiFormatIdeaResult>(content);
+  };
+
+  let result: MultiFormatIdeaResult;
+  try {
+    result = await parseResponse();
+  } catch (error) {
+    console.warn('Multi-format idea parsing failed on first attempt, retrying generation once:', error);
+    result = await parseResponse();
+  }
+  
+  console.log(`📝 Generated 3 formats - REEL: "${result.reel.hook.substring(0, 30)}..." | CAROUSEL: "${result.carousel.hook.substring(0, 30)}..." | STORY: "${result.story.hook.substring(0, 30)}..."`);
+  
+  return result;
+}
+
+export async function structureUserIdea(input: {
+  ideaText: string;
+  niche: string;
+  contentPreferences?: any;
+}): Promise<StructuredIdeaResult> {
+  const { prompt, ctaStyle } = buildStructuredIdeaPrompt(input);
+  let normalizedResult: StructuredIdeaResult;
+  const resolveGuaranteedStructuredIdea = async (): Promise<StructuredIdeaResult> => {
+    try {
+      const taggedFallback = await generateStructuredIdeaTaggedFallback(input, ctaStyle);
+      return isStructuredIdeaResultIncomplete(taggedFallback)
+        ? buildStructuredIdeaEmergencyResult(input)
+        : taggedFallback;
+    } catch (error) {
+      console.warn('Structured idea tagged fallback failed, using emergency fallback:', error);
+      return buildStructuredIdeaEmergencyResult(input);
+    }
+  };
+
+  const parsePrimaryStructuredIdea = async (): Promise<StructuredIdeaResult> => {
+    const content = await generateAnthropicJson(prompt, 0.45, 3400);
+    return normalizeStructuredIdeaResult(
+      await parseModelJson<StructuredIdeaResult>(content),
+      ctaStyle
+    );
+  };
+
+  try {
+    try {
+      normalizedResult = await parsePrimaryStructuredIdea();
+    } catch (error) {
+      console.warn('Structured idea primary parsing failed on first attempt, retrying once:', error);
+      normalizedResult = await parsePrimaryStructuredIdea();
+    }
+  } catch (error) {
+    console.warn('Structured idea JSON parsing failed, switching to tagged fallback:', error);
+    return resolveGuaranteedStructuredIdea();
+  }
+
+  if (!isStructuredIdeaResultIncomplete(normalizedResult)) {
+    return normalizedResult;
+  }
+
+  try {
+    const completedResult = await generateStructuredIdeaFallback(input, normalizedResult, ctaStyle);
+    return isStructuredIdeaResultIncomplete(completedResult)
+      ? await resolveGuaranteedStructuredIdea()
+      : completedResult;
+  } catch (error) {
+    console.warn('Structured idea completion fallback failed, switching to tagged fallback:', error);
+    return resolveGuaranteedStructuredIdea();
+  }
+}
+
+// ==================== WHISPER TRANSCRIPTION ====================
+
+export interface TranscriptionResult {
+  text: string;
+  language?: string;
+  duration?: number;
+}
+
+export async function transcribeAudio(audioFilePath: string): Promise<TranscriptionResult> {
+  try {
+    console.log(`🎙️ Transcribing audio from: ${audioFilePath}`);
+    
+    const transcription = await transcriptionClient.audio.transcriptions.create({
+      file: createReadStream(audioFilePath),
+      model: 'whisper-1',
+      language: 'ro', // Romanian
+      response_format: 'verbose_json',
+    });
+
+    console.log(`✅ Transcription complete: ${transcription.text.substring(0, 100)}...`);
+    
+    return {
+      text: transcription.text,
+      language: transcription.language,
+      duration: transcription.duration,
+    };
+  } catch (error: any) {
+    console.error('❌ Whisper transcription failed:', error);
+    throw new Error(`Transcription failed: ${error.message}`);
+  }
+}
+
+// ==================== CONTENT FEEDBACK ====================
+
+export interface ContentFeedbackInput {
+  fileType: 'video' | 'image';
+  fileUrl: string;
+  duration?: number;
+  niche?: string; // Optional context
+  transcription?: string; // Whisper transcription for video
+}
+
+export interface Suggestion {
+  type: 'error' | 'warning' | 'success';
+  category: string;
+  text: string;
+}
+
+export interface ContentFeedbackResult {
+  clarityScore: number;
+  relevanceScore: number;
+  trustScore: number;
+  ctaScore: number;
+  overallScore: number;
+  suggestions: Suggestion[];
+  summary: string;
+  transcription?: string; // Return transcription for video
+}
+
+export async function analyzeFeedback(input: ContentFeedbackInput): Promise<ContentFeedbackResult> {
+  console.log(`🔍 analyzeFeedback called with:`, {
+    fileType: input.fileType,
+    hasNiche: !!input.niche,
+    niche: input.niche?.substring(0, 50),
+    hasTranscription: !!input.transcription,
+    transcriptionLength: input.transcription?.length || 0,
+    transcriptionPreview: input.transcription?.substring(0, 100),
+  });
+
+  const prompt = `Tu ești un expert în analiza content-ului fitness pe social media.
+
+Analizează acest ${input.fileType === 'video' ? 'VIDEO/REEL' : 'imagine/carousel'} pentru content fitness.
+
+${input.niche ? `📍 NIȘA: "${input.niche}"` : ''}
+${input.duration ? `⏱️ DURATĂ VIDEO: ${input.duration} secunde` : ''}
+
+${input.transcription ? `
+🎙️ TRANSCRIPTION COMPLETĂ (din Whisper AI):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${input.transcription}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ IMPORTANT: TRANSCRIPȚIA DE MAI SUS ESTE CONȚINUTUL REAL AL VIDEO-ULUI!
+Analizează transcripția word-by-word și evaluează calitatea conținutului video bazat pe ce se spune efectiv.
+NU spune că nu ai primit video-ul - transcripția este conținutul complet audio extras din video.
+` : `
+⚠️ ATENȚIE: Nu există transcription pentru acest ${input.fileType}.
+${input.fileType === 'video' ? 'Transcripția audio a eșuat. ' : ''}
+Oferă o analiză generică bazată pe best practices.
+`}
+
+Evaluează pe 4 criterii (0-100)${input.transcription ? ' BAZAT PE TRANSCRIPȚIA DE MAI SUS' : ''}:
+
+1. CLARITATE (0-100): 
+   ${input.transcription ? `
+   - Citește transcripția și evaluează dacă mesajul este clar
+   - Verifică structura logică a cuvintelor spuse
+   - Hook-ul din primele 3-5 secunde oprește scroll-ul?
+   - Livrarea este clară și ușor de urmărit?
+   ` : `
+   - Mesajul este ușor de înțeles? 
+   - Structura este logică?
+   - Hook-ul oprește scroll-ul?
+   `}
+
+2. RELEVANȚĂ (0-100):
+   - Vorbește direct problemelor audienței fitness?
+   - Este specific pentru nișă?
+   - Pain points clare și reale?
+   ${input.transcription ? '- Limbajul folosit rezonează cu audiența?' : ''}
+
+3. ÎNCREDERE (0-100):
+   - Include dovezi sociale, rezultate reale, autoritate?
+   - Tonul inspiră încredere?
+   - Evită promisiuni exagerate?
+   ${input.transcription ? '- Autenticitate în livrare?' : ''}
+
+4. CTA (0-100):
+   - Call-to-action clar, specific, acționabil?
+   - Este conectat natural la conținut?
+   - Oferă beneficiu clar?
+   ${input.transcription ? '- CTA-ul apare în transcripție?' : ''}
+
+IMPORTANT: Dă 3-5 sugestii CONCRETE și ACȚIONABILE bazate pe ${input.transcription ? 'transcripția reală' : 'tipul de conținut'}:
+- "error": Problemă MAJORĂ care blochează conversia (ex: lipsă CTA, mesaj confuz)
+- "warning": Oportunitate ratată care ar putea dubla performanța
+- "success": Ceva care funcționează FOARTE bine și trebuie păstrat
+
+Răspunde DOAR în format JSON strict, fără markdown:
+{
+  "clarityScore": 82,
+  "relevanceScore": 91,
+  "trustScore": 68,
+  "ctaScore": 45,
+  "overallScore": 72,
+  "suggestions": [
+    {
+      "type": "error",
+      "category": "cta",
+      "text": "Sugestie concretă și acționabilă bazată pe conținutul real"
+    },
+    {
+      "type": "warning",
+      "category": "hook",
+      "text": "Sugestie concretă pentru îmbunătățire"
+    },
+    {
+      "type": "success",
+      "category": "relevance",
+      "text": "Ce funcționează foarte bine"
+    }
+  ],
+  "summary": "Rezumat în 2-3 propoziții: ce funcționează, ce lipsește, și impactul potențial după îmbunătățiri"
+}`;
+
+  console.log(`🤖 Analyzing content with Anthropic${input.transcription ? ' (with Whisper transcription)' : ''}...`);
+  
+  const messages = input.transcription ? [
+    { 
+      role: 'system' as const, 
+      content: 'You are analyzing fitness content. When a transcription is provided, it represents the COMPLETE audio content of the video. Analyze it thoroughly and provide specific feedback based on what was actually said. DO NOT say you did not receive the content - the transcription IS the content.' 
+    },
+    { role: 'user' as const, content: prompt }
+  ] : [
+    { role: 'user' as const, content: prompt }
+  ];
+
+  const content =
+    (await generateAnthropicTextFromMessages(messages, 0.6, 1500)) || '{}';
+  const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+  const result = JSON.parse(cleaned);
+  
+  // Include transcription in response
+  if (input.transcription) {
+    result.transcription = input.transcription;
+  }
+  
+  console.log(`✅ Analysis complete - Overall: ${result.overallScore}/100`);
+  return result;
+}
+
+// ==================== QUESTIONNAIRE: DISCOVER NICHE (PHASE A) ====================
+
+export interface NicheDiscoverPhaseAInput {
+  gender: string;
+  ageRanges: string[];
+  valueSituations: string[];
+  commonProblems: string[];
+  primaryOutcome: string;
+  avoidContent: string[];
+}
+
+export interface NicheVariant {
+  variant: string;
+  description: string;
+}
+
+export interface PresetNicheOption {
+  niche: string;
+  description: string;
+}
+
+function buildPresetNicheDescription(niche: string): string {
+  const normalized = niche.toLowerCase();
+
+  if (normalized.includes('post-partum') || normalized.includes('postpartum') || normalized.includes('post-natal')) {
+    return 'Pentru femei care vor să revină în formă după sarcină, cu un plan sigur, realist și adaptat perioadei post-partum.';
+  }
+
+  if (normalized.includes('femei')) {
+    return 'Pentru femei care vor rezultate vizibile printr-un proces clar, sustenabil și ușor de urmat.';
+  }
+
+  if (normalized.includes('bărbați') || normalized.includes('barbati')) {
+    return 'Pentru bărbați care vor să slăbească, să arate mai bine și să urmeze un plan simplu, fără complicații inutile.';
+  }
+
+  if (normalized.includes('35+') || normalized.includes('40+') || normalized.includes('persoane 35')) {
+    return 'Pentru adulți care vor mai multă energie, mai puțină grăsime și un program potrivit ritmului lor de viață.';
+  }
+
+  if (normalized.includes('începători') || normalized.includes('incepatori') || normalized.includes('sedentari')) {
+    return 'Pentru persoane care pornesc de la zero și au nevoie de pași clari ca să capete consistență și rezultate reale.';
+  }
+
+  return `Pentru persoane interesate de ${niche.toLowerCase()}, cu focus pe rezultate clare și un proces ușor de urmat.`;
+}
+
+const PRESET_NICHE_FALLBACKS: PresetNicheOption[] = [
+  {
+    niche: 'Slăbire pentru femei ocupate 30-45',
+    description:
+      'Pentru femei care vor să slăbească sustenabil, fără diete extreme, chiar dacă au un program aglomerat.',
+  },
+  {
+    niche: 'Tonifiere și revenire post-natală',
+    description:
+      'Pentru mame care vor să-și recapete energia, tonusul și încrederea după sarcină, cu pași siguri și realiști.',
+  },
+  {
+    niche: 'Transformare pentru bărbați ocupați',
+    description:
+      'Pentru bărbați care vor să dea jos grăsimea abdominală și să arate mai bine, fără să petreacă ore în sală.',
+  },
+  {
+    niche: 'Fitness pentru începători sedentari',
+    description:
+      'Pentru persoane care pornesc de la zero și au nevoie de un plan simplu ca să slăbească și să prindă consistență.',
+  },
+  {
+    niche: 'Recompunere corporală pentru persoane 35+',
+    description:
+      'Pentru adulți care vor să piardă grăsime, să-și păstreze masa musculară și să aibă mai multă energie după 35 de ani.',
+  },
+];
+
+function normalizeNicheVariantEntry(value: unknown, index: number): NicheVariant | null {
+  if (typeof value === 'string') {
+    const variant = value.trim();
+    return variant ? { variant, description: '' } : null;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const variant = normalizeTextValue(
+    source.variant ?? source.title ?? source.niche ?? source.name ?? source.option
+  );
+  const description = normalizeTextValue(
+    source.description ?? source.details ?? source.reasoning ?? source.summary
+  );
+
+  if (!variant) {
+    return null;
+  }
+
+  return {
+    variant,
+    description: description || `Varianta ${index + 1}`,
+  };
+}
+
+function buildFallbackNicheVariants(input: NicheDiscoverPhaseAInput): NicheVariant[] {
+  const audience =
+    input.gender === 'femei'
+      ? 'femei'
+      : input.gender === 'barbati'
+        ? 'bărbați'
+        : 'adulți';
+  const ages = input.ageRanges.length ? input.ageRanges.join(', ') : '25-45 ani';
+  const topSituation = input.valueSituations[0] || 'vor rezultate realiste';
+  const topProblem = input.commonProblems[0] || 'nu reușesc să rămână constanți';
+  const topOutcome = input.primaryOutcome || 'slăbire sustenabilă';
+
+  return [
+    {
+      variant: `${topOutcome} pentru ${audience} ${ages}`,
+      description: `Pentru ${audience} care ${topSituation.toLowerCase()} și se lovesc frecvent de problema "${topProblem}". Accent pe un proces clar și realist spre ${topOutcome.toLowerCase()}.`,
+    },
+    {
+      variant: `Transformare sustenabilă pentru ${audience} ocupați`,
+      description: `Pentru ${audience} cu program aglomerat care vor rezultate vizibile fără soluții extreme. Mesajul central rezolvă ${topProblem.toLowerCase()} și duce spre ${topOutcome.toLowerCase()}.`,
+    },
+    {
+      variant: `Fitness simplificat pentru ${audience} care vor consistență`,
+      description: `Pentru ${audience} care au nevoie de claritate, structură și pași aplicabili. Nișa pune accent pe contextul lor real și pe progres constant către ${topOutcome.toLowerCase()}.`,
+    },
+  ];
+}
+
+export async function generateNicheVariants(input: NicheDiscoverPhaseAInput): Promise<{ variants: NicheVariant[] }> {
+  const prompt = `Tu ești un expert în marketing fitness. Pe baza răspunsurilor antrenorului, propune EXACT 3 variante de nișă.
+
+RĂSPUNSURI ANTRENOR:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👥 Gen preferă să lucreze cu: ${input.gender}
+🎯 Vârsta clienților care merg bine: ${input.ageRanges.join(', ')}
+💡 Situații unde aduce valoare: ${input.valueSituations.join(', ')}
+🚨 Problemă explicată cel mai des: ${input.commonProblems.join(', ')}
+✅ Ce vrea să rezolve în 2-3 luni: ${input.primaryOutcome}
+❌ Content de evitat: ${input.avoidContent.join(', ') || 'N/A'}
+
+Creează EXACT 3 variante de nișă diferite. Fiecare variantă:
+- "variant": Titlul nișei (1 propoziție scurtă, specifică)
+- "description": Descriere mai detaliată (2-3 propoziții despre cine e clientul și ce problemă rezolvi)
+
+Răspunde DOAR în format JSON strict, fără markdown.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "variants": [
+    {"variant": "Titlu nișă 1", "description": "Descriere detaliată 1"},
+    {"variant": "Titlu nișă 2", "description": "Descriere detaliată 2"},
+    {"variant": "Titlu nișă 3", "description": "Descriere detaliată 3"}
+  ]
+}`;
+
+  const content = await generateAnthropicJson(prompt, 0.8, 700);
+  const parsed = await parseModelJson<any>(content);
+  const rawVariants = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.variants)
+      ? parsed.variants
+      : Array.isArray(parsed?.options)
+        ? parsed.options
+        : [];
+
+  const variants = rawVariants
+    .map((variant: unknown, index: number) => normalizeNicheVariantEntry(variant, index))
+    .filter((variant: NicheVariant | null): variant is NicheVariant => Boolean(variant))
+    .slice(0, 3);
+
+  const usedTitles = new Set(variants.map((variant: NicheVariant) => variant.variant.toLowerCase()));
+  for (const fallback of buildFallbackNicheVariants(input)) {
+    if (variants.length >= 3) {
+      break;
+    }
+
+    if (usedTitles.has(fallback.variant.toLowerCase())) {
+      continue;
+    }
+
+    variants.push(fallback);
+    usedTitles.add(fallback.variant.toLowerCase());
+  }
+
+  if (!variants.length) {
+    throw new Error('No niche variants were generated');
+  }
+
+  return { variants };
+}
+
+export async function generatePresetNicheOptions(): Promise<{ niches: PresetNicheOption[] }> {
+  const prompt = `Tu ești un expert în marketing fitness pentru antrenori din România.
+
+Generează EXACT 5 nișe prestabilite în limba română pe care un fitness coach din România le-ar putea alege rapid.
+
+CERINȚE:
+- Fiecare nișă trebuie să fie clară, specifică și realistă pentru un antrenor de fitness.
+- Evită formulări prea generale sau corporate.
+- Variază publicul și rezultatul promis.
+- "niche" = titlu scurt, clar, ușor de ales dintr-un click.
+- "description" = 1-2 propoziții despre cui se adresează și ce rezultat urmărește.
+- Tot output-ul trebuie să fie exclusiv în română naturală.
+
+Răspunde DOAR în JSON strict.
+
+FORMAT:
+{
+  "niches": [
+    { "niche": "string", "description": "string" },
+    { "niche": "string", "description": "string" },
+    { "niche": "string", "description": "string" },
+    { "niche": "string", "description": "string" },
+    { "niche": "string", "description": "string" }
+  ]
+}`;
+
+  const content = await generateAnthropicJson(prompt, 0.7, 900);
+  const parsed = await parseModelJson<any>(content);
+  const rawNiches = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.niches)
+      ? parsed.niches
+      : Array.isArray(parsed?.variants)
+        ? parsed.variants
+        : [];
+
+  const niches = rawNiches
+    .map((entry: any) => {
+      const niche = normalizeTextValue(
+        entry?.niche ?? entry?.variant ?? entry?.title ?? entry?.name
+      );
+      const description = normalizeTextValue(
+        entry?.description ?? entry?.details ?? entry?.summary
+      );
+
+      if (!niche) {
+        return null;
+      }
+
+      return {
+        niche,
+        description: description || buildPresetNicheDescription(niche),
+      };
+    })
+    .filter((entry: PresetNicheOption | null): entry is PresetNicheOption => Boolean(entry))
+    .slice(0, 5);
+
+  const usedTitles = new Set(niches.map((entry: PresetNicheOption) => entry.niche.toLowerCase()));
+
+  for (const fallback of PRESET_NICHE_FALLBACKS) {
+    if (niches.length >= 5) {
+      break;
+    }
+
+    if (usedTitles.has(fallback.niche.toLowerCase())) {
+      continue;
+    }
+
+    niches.push(fallback);
+    usedTitles.add(fallback.niche.toLowerCase());
+  }
+
+  return { niches };
+}
+
+// ==================== QUESTIONNAIRE: DISCOVER NICHE (PHASE C - REFINEMENT) ====================
+
+export interface NicheDiscoverInput {
+  // Phase A answers
+  gender: string;
+  ageRanges: string[];
+  valueSituations: string[];
+  commonProblems: string[];
+  primaryOutcome: string;
+  avoidContent: string[];
+  // Selected niche variant
+  selectedNiche: string;
+  // Phase C (refinement) answers
+  awarenessLevel?: string;
+  identityStory?: string;
+  clientStatement: string;
+  dominantGoals: string[];
+  primaryGoal: string;
+  wakeUpTime?: string;
+  jobType?: string;
+  sittingTime?: string;
+  morning?: string[];
+  lunch?: string[];
+  evening?: string[];
+  definingSituations?: string[];
+  notes?: string;
+}
+
+export async function generateNicheDiscover(input: NicheDiscoverInput): Promise<NicheResult> {
+  const prompt = `Tu ești un expert în marketing fitness. Antrenorul a ales nișa "${input.selectedNiche}" și acum vrei să o rafinezi pe baza răspunsurilor detaliate.
+
+Creează:
+1. Nișa RAFINATĂ și specifică (1 propoziție precisă, bazată pe "${input.selectedNiche}" dar mai precizată)
+2. Profilul clientului ideal ULTRA-DETALIAT (5-6 paragrafe care combină tot ce știi)
+3. Mesaj de poziționare puternic (2-3 propoziții, unique value proposition)
+
+CONTEXTUL INIȚIAL (Faza A):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👥 Gen: ${input.gender}
+🎯 Vârstă: ${input.ageRanges.join(', ')}
+💡 Situații valoare: ${input.valueSituations.join(', ')}
+🚨 Problemă frecventă: ${input.commonProblems.join(', ')}
+✅ Obiectiv 2-3 luni: ${input.primaryOutcome}
+❌ Content de evitat: ${input.avoidContent.join(', ') || 'N/A'}
+
+NIȘA ALEASĂ (Faza B):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📌 "${input.selectedNiche}"
+
+RAFINARE (Faza C):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧠 Nivel awareness: "${input.awarenessLevel || 'N/A'}"
+🪞 Poveste identitate: "${input.identityStory || 'N/A'}"
+🚧 Blocaj principal: "${input.clientStatement}"
+🎯 Obiective: ${input.dominantGoals.join(', ')}
+⭐ Obiectiv principal: ${input.primaryGoal}
+
+ZIUA TIPICĂ A CLIENTULUI:
+⏰ Trezire: ${input.wakeUpTime || 'N/A'}
+💼 Job: ${input.jobType || 'N/A'}
+🪑 Timp șezând: ${input.sittingTime || 'N/A'}
+🌅 Dimineața: ${input.morning?.join(', ') || 'N/A'}
+🍽️ Prânz: ${input.lunch?.join(', ') || 'N/A'}
+🌙 Seara: ${input.evening?.join(', ') || 'N/A'}
+⭐ Situații: ${input.definingSituations?.join(', ') || 'N/A'}
+${input.notes ? `📝 Note: ${input.notes}` : ''}
+
+INSTRUCȚIUNI:
+- "niche": Rafinează nișa aleasă să fie SUPER precisă (include vârsta, situația, obiectivul principal)
+- "idealClient": Scrie 5-6 paragrafe DETALIATE în proză (nu bullet points):
+  * Paragraf 1: Cine sunt (demografic + situație de viață)
+  * Paragraf 2: Rutina zilnică (de la trezire la culcare)
+  * Paragraf 3: Pain points și frustrări (awareness + identitate + blocaje)
+  * Paragraf 4: Obiective și motivații (ce vor cu adevărat)
+  * Paragraf 5-6: De ce alte soluții nu au funcționat + ce îi face unici
+- "positioning": Mesaj puternic care vorbește direct despre problema lor principală
+
+Răspunde DOAR în format JSON strict, fără markdown.
+IMPORTANT:
+- JSON valid obligatoriu
+- Fără ghilimele duble ne-escape-uite în interiorul valorilor text
+- Dacă ai nevoie de citare în text, folosește apostrof simplu
+
+FORMAT:
+{
+  "niche": "Nișa ta RAFINATĂ aici",
+  "idealClient": "Profilul ULTRA-DETALIAT (5-6 paragrafe în proză)",
+  "positioning": "Mesajul tău de poziționare puternic"
+}`;
+
+  const content = await generateAnthropicJson(prompt, 0.7, 1200);
+  const parsed = await parseModelJson<Partial<NicheResult>>(content);
+  const contextHint = [
+    `nișa selectată ${input.selectedNiche}`,
+    `gen ${input.gender}`,
+    `vârste ${input.ageRanges.join(', ')}`,
+    `probleme ${input.commonProblems.join(', ')}`,
+    `obiectiv ${input.primaryOutcome}`,
+    `blocaj ${input.clientStatement}`,
+    `obiectiv principal ${input.primaryGoal}`,
+  ]
+    .filter(Boolean)
+    .join('; ');
+  return ensureCompleteNicheResult(parsed, contextHint);
+}
+
+// ==================== QUESTIONNAIRE: ICP DAY ====================
+
+export interface ICPDayInput {
+  gender: string;
+  ageRanges: string[];
+  wakeUpTime?: string;
+  jobType?: string;
+  sittingTime?: string;
+  morning?: string[];
+  lunch?: string[];
+  evening?: string[];
+  definingSituations?: string[];
+  notes?: string;
+}
+
+export async function generateICPDay(input: ICPDayInput): Promise<{ icpProfile: string }> {
+  const prompt = `Tu ești un expert în marketing fitness. Pe baza informațiilor despre ziua tipică a clientului ideal, creează un profil ICP detaliat (3-4 paragrafe) care descrie:
+
+1. Demografic (gen, vârstă)
+2. Rutina zilnică (job, program, mese)
+3. Pain points și obstacole
+4. Situații definitorii
+
+INFORMAȚII CLIENT IDEAL:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👥 Gen: ${input.gender}
+🎯 Vârstă: ${input.ageRanges.join(', ')}
+⏰ Trezire: ${input.wakeUpTime || 'N/A'}
+💼 Tip job: ${input.jobType || 'N/A'}
+🪑 Timp șezând: ${input.sittingTime || 'N/A'}
+🌅 Dimineața: ${input.morning?.join(', ') || 'N/A'}
+🍽️ Prânz: ${input.lunch?.join(', ') || 'N/A'}
+🌙 Seara: ${input.evening?.join(', ') || 'N/A'}
+⭐ Situații definitorii: ${input.definingSituations?.join(', ') || 'N/A'}
+${input.notes ? `📝 Note: ${input.notes}` : ''}
+
+Scrie un profil de client ideal natural, în română, 3-4 paragrafe. NU folosi bullet points, doar proză.
+
+Răspunde DOAR cu textul profilului (fără JSON, fără markdown).`;
+
+  const icpProfile = (await generateAnthropicText(prompt, 0.7, 700)) || '';
+  return { icpProfile };
+}
+
+// ==================== TEXT CONTENT FEEDBACK ====================
+
+export interface TextContentFeedbackInput {
+  text: string;
+  format: string; // 'reel', 'carousel', 'story', 'general'
+  niche?: string;
+  icpProfile?: any;
+  positioningMessage?: string;
+  toneOfVoice?: string;
+}
+
+export async function analyzeTextContent(input: TextContentFeedbackInput): Promise<ContentFeedbackResult> {
+  const formatInstructions = {
+    reel: 'REEL (30-60 secunde, 4-6 scene): Hook dinamic, script energic, vizual puternic',
+    carousel: 'CAROUSEL (6-9 slide-uri): Hook intrigant, fiecare slide = un pas/idee, perfect pentru liste',
+    story: 'STORY (15 secunde, 3-4 scene): Hook instant, mesaj concentrat, urgență maximă',
+    general: 'POST general: Claritateși mesaj clar',
+  };
+
+  const formatGuide = formatInstructions[input.format as keyof typeof formatInstructions] || formatInstructions.general;
+
+  // Build personalized context
+  let contextSection = '';
+  if (input.niche) {
+    contextSection += `📍 NIȘA TA: "${input.niche}"\n`;
+  }
+  if (input.icpProfile) {
+    const icpText = typeof input.icpProfile === 'string' ? input.icpProfile : JSON.stringify(input.icpProfile);
+    contextSection += `👤 CLIENTUL TĂU IDEAL: ${icpText.substring(0, 300)}${icpText.length > 300 ? '...' : ''}\n`;
+  }
+  if (input.positioningMessage) {
+    contextSection += `🎯 OFERTA TA: "${input.positioningMessage}"\n`;
+  }
+  if (input.toneOfVoice) {
+    contextSection += `🗣️ TON: "${input.toneOfVoice}"\n`;
+  }
+
+  const prompt = `Tu ești un expert în analiza content-ului fitness pe social media specializat în conversii.
+
+${contextSection ? `CONTEXTUL TĂU PERSONAL:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${contextSection}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` : ''}FORMAT POSTARE: ${formatGuide}
+
+TEXTUL POSTAT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${input.text}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Analizează acest conținut și evaluează pe 4 criterii (0-100):
+
+1. **CLARITATE (0-100)**: 
+   - Hook-ul captează atenția în primele 3 secunde/cuvinte?
+   - Mesajul e clar și ușor de înțeles?
+   - Structura e logică (problemă → agitație → soluție → CTA)?
+   ${contextSection ? `- Vorbește direct către CLIENTUL TĂU IDEAL din profilul de mai sus?` : ''}
+
+2. **RELEVANȚĂ (0-100)**: 
+   - Conținutul vorbește despre problemele reale ale audienței fitness?
+   ${input.niche ? `- E specific pentru nișa "${input.niche}"?` : ''}
+   ${input.icpProfile ? `- Se adresează direct pain points-urilor clientului tău ideal?` : ''}
+   - Evită generalizări și e targetat?
+
+3. **ÎNCREDERE (0-100)**: 
+   - Include dovezi sociale (rezultate, testimoniale, statistici)?
+   - Antrenorul apare credibil și autoritar?
+   - Are social proof sau proof of results?
+   ${input.positioningMessage ? `- Reflectă unique value proposition-ul: "${input.positioningMessage}"?` : ''}
+
+4. **CTA (0-100)**: 
+   - Call-to-action este clar, specific și acționabil?
+   - Include keyword pentru DM (ex: "Scrie PLAN în DM")?
+   - Oferă un lead magnet relevant?
+   ${input.niche ? `- Lead magnet-ul rezolvă problema specifică nișei?` : ''}
+
+IMPORTANT: Generează 5-8 sugestii ULTRA-SPECIFICE, DETALIATE și ACȚIONABILE:
+- **"error"** (roșu): Problemă MAJORĂ care blochează conversia - trebuie fixată imediat
+  ${contextSection ? `Exemplu COMPLET: "Hook-ul e generic și nu captează atenția nișei tale. Pentru '${input.niche}', înlocuiește hook-ul actual cu: '[hook specific și COMPLET adaptat nișei - 2-3 propoziții cu exemplu concret]'. Asta va crește retention cu 35-40% pentru că vorbește direct către pain point-ul principal al clientului tău ideal: [pain point specific din ICP]."` : 'Exemplu COMPLET: "Lipsește CTA-ul complet, ceea ce blochează 60-70% din conversii potențiale. Adaugă la final (după scenă/slide X): \'Scrie KEYWORD în DM acum și primești [descriere COMPLETĂ lead magnet cu beneficii specifice]\'. Fără CTA clar, pierzi lead-urile chiar dacă content-ul e bun."'}
+- **"warning"** (galben): Oportunitate ratată care ar putea dubla performanța - include explicație DETALIATĂ
+  ${input.icpProfile ? `Exemplu COMPLET: "Nu menționezi [pain point SPECIFIC din ICP]. În scenă/slide 2-3, adaugă: '[soluție COMPLETĂ și SPECIFICĂ cu pași concreți - 3-4 propoziții]'. Asta rezonează direct cu clientul tău ideal care se confruntă zilnic cu [situație specifică din ICP]. Ar putea crește engagement-ul cu 45-50%."` : 'Exemplu COMPLET: "Lipsă social proof = oportunitate URIAȘĂ ratată. Adaugă în scenă 3: \'Rezultate reale: [nume client] a slăbit X kg în Y zile, [alt client] și-a redus [metric specific] cu Z%. Vezi testimoniale complete la [link/bio].\' Social proof-ul poate crește trustul cu 60-80% și conversiile cu 30-40%."'}
+- **"success"** (verde): Ceva care funcționează FOARTE bine - continuă așa! Include explicație psihologică DETALIATĂ
+  Exemplu COMPLET: "Hook-ul captează PERFECT atenția cu pattern interrupt puternic - folosești [tehnică specifică] care oprește scroll-ul instantaneu. Rezultat: retention de 40-50% în primele 3 secunde (vs. media de 15-20%). Continuă cu această strategie pentru toate postările - funcționează exceptional pentru nișa ta pentru că [explicație psihologică detaliată 2-3 propoziții]."
+
+${contextSection ? `\n⚠️ CRITICI BRUTALE: Fii EXTREM de specific și detaliat - folosește COMPLET contextul personal (nișa, profilul clientului detaliat, positioning, ton) pentru sugestii ULTRA-PERSONALIZATE cu exemple COMPLETE. NU da sfaturi generice de 1 rând! Fiecare sugestie = 4-6 propoziții cu:
+  1. Ce e problema/oportunitatea EXACT
+  2. Ce să facă CONCRET (cu exemplu COMPLET de text/script)
+  3. DE CE funcționează (psihologie, date, impact pe conversie)
+  4. Cum se leagă de nișa/ICP-ul său SPECIFIC` : '\n⚠️ Fiecare sugestie trebuie să fie FOARTE DETALIATĂ (4-6 propoziții) cu exemple COMPLETE de ce să adauge/schimbe.'}
+
+Categorii pentru sugestii: "hook", "clarity", "social-proof", "cta", "structure", "relevance", "trust", "format", "storytelling", "pain-points", "positioning"
+
+Răspunde DOAR în format JSON strict, fără markdown:
+{
+  "clarityScore": 82,
+  "relevanceScore": 91,
+  "trustScore": 68,
+  "ctaScore": 45,
+  "overallScore": 72,
+  "suggestions": [
+    {
+      "type": "error",
+      "category": "cta",
+      "text": "Sugestie ULTRA-DETALIATĂ cu 4-6 propoziții: problema exact, ce să facă CONCRET cu exemplu COMPLET de text, de ce funcționează (psihologie + date), cum se leagă de nișa/ICP specific"
+    },
+    {
+      "type": "warning",
+      "category": "social-proof",
+      "text": "Sugestie ULTRA-DETALIATĂ cu 4-6 propoziții: oportunitatea, exemplu COMPLET de ce să adauge, impact pe conversie, legătură cu audiența specifică"
+    },
+    {
+      "type": "success",
+      "category": "hook",
+      "text": "Ce funcționează FOARTE bine - 4-6 propoziții DETALIATE: ce anume e bun, de ce funcționează (psihologie detaliată), rezultate așteptate, cum să replice strategia"
+    },
+    {
+      "type": "warning",
+      "category": "pain-points",
+      "text": "Sugestie ULTRA-DETALIATĂ 4-6 propoziții"
+    },
+    {
+      "type": "error",
+      "category": "relevance",
+      "text": "Sugestie ULTRA-DETALIATĂ 4-6 propoziții"
+    }
+  ],
+  "summary": "Rezumat DETALIAT în 4-6 propoziții: (1) Ce funcționează bine și de ce, (2) Top 2-3 probleme PRIORITARE cu impact pe conversie, (3) Ce să îmbunătățească EXACT (cu pași concreți) pentru +X puncte overall, (4) Cum să folosească mai bine nișa și profilul clientului specific${contextSection ? ` - include referințe DIRECTE la '${input.niche}' și la pain points-urile din ICP` : ''}"
+}`;
+
+  console.log(`📝 Analyzing ${input.format} text content (${input.text.length} chars)${input.niche ? ` for niche: "${input.niche}"` : ''}...`);
+
+  const content = (await generateAnthropicText(prompt, 0.6, 3000)) || '{}';
+  console.log(`✅ Text analysis completed (${content.length} chars response)`);
+  
+  const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+  const result = JSON.parse(cleaned);
+  
+  console.log(`📊 Scores: Clarity ${result.clarityScore}, Relevance ${result.relevanceScore}, Trust ${result.trustScore}, CTA ${result.ctaScore} → Overall ${result.overallScore}`);
+  
+  return result;
+}
+
+// ==================== EMAIL MARKETING ====================
+
+export interface GenerateMarketingEmailInput {
+  topic: string;
+  objective: 'lead-magnet' | 'nurture' | 'sales' | 'reengagement';
+  emailType: 'single' | 'welcome' | 'promo' | 'newsletter';
+  tone: 'direct' | 'empathetic' | 'authoritative' | 'friendly';
+  offer?: string;
+  audiencePain?: string;
+  ctaGoal?: string;
+  language: 'ro' | 'en';
+  userContext: {
+    name?: string;
+    niche?: string;
+    icpProfile?: unknown;
+    positioningMessage?: string;
+    contentPreferences?: unknown;
+  };
+}
+
+export interface MarketingEmailResult {
+  subjectOptions: string[];
+  previewText: string;
+  body: string;
+  cta: string;
+  angles: string[];
+}
+
+export async function generateMarketingEmail(
+  input: GenerateMarketingEmailInput
+): Promise<MarketingEmailResult> {
+  const icp =
+    typeof input.userContext.icpProfile === 'string'
+      ? input.userContext.icpProfile
+      : JSON.stringify(input.userContext.icpProfile || {});
+  const contentPrefs = JSON.stringify(input.userContext.contentPreferences || {});
+
+  const prompt = `Tu ești un expert senior în email marketing pentru antrenori fitness.
+
+Generează un email marketing care convertește folosind contextul global al utilizatorului.
+
+CONTEXT GLOBAL UTILIZATOR:
+- Nume: ${input.userContext.name || 'N/A'}
+- Nișă: ${input.userContext.niche || 'N/A'}
+- ICP: ${icp || 'N/A'}
+- Poziționare: ${input.userContext.positioningMessage || 'N/A'}
+- Content preferences: ${contentPrefs || 'N/A'}
+
+BRIEF EMAIL:
+- Topic: ${input.topic}
+- Objective: ${input.objective}
+- Email type: ${input.emailType}
+- Tone: ${input.tone}
+- Offer: ${input.offer || 'N/A'}
+- Audience pain: ${input.audiencePain || 'N/A'}
+- CTA goal: ${input.ctaGoal || 'N/A'}
+- Language: ${input.language}
+
+CERINȚE:
+1) Emailul trebuie să fie specific nișei și ICP-ului, NU generic.
+2) Include mecanisme de conversie: hook, relevanță, proof, CTA clar.
+3) Body în format plain text, ușor de trimis prin orice provider.
+4) Evită promisiuni nerealiste.
+5) Subject options să fie scurte și clare (max ~60 caractere).
+6) Preview text max ~120 caractere.
+7) Body max 350 cuvinte.
+
+Răspunde DOAR JSON strict:
+{
+  "subjectOptions": ["subiect 1", "subiect 2", "subiect 3"],
+  "previewText": "preview",
+  "body": "corpul complet al emailului",
+  "cta": "cta final clar",
+  "angles": ["unghi 1", "unghi 2", "unghi 3"]
+}`;
+
+  const content = (await generateAnthropicText(prompt, 0.65, 1800)) || '{}';
+  const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+  const parsed = JSON.parse(cleaned);
+
+  return {
+    subjectOptions: Array.isArray(parsed.subjectOptions)
+      ? parsed.subjectOptions.slice(0, 3)
+      : [],
+    previewText: parsed.previewText || '',
+    body: parsed.body || '',
+    cta: parsed.cta || '',
+    angles: Array.isArray(parsed.angles) ? parsed.angles.slice(0, 5) : [],
+  };
+}
+
+// ==================== CLIENT NUTRITION ====================
+
+export interface GenerateClientNutritionPlanInput {
+  calories: number;
+  proteinGrams: number;
+  fatGrams: number;
+  carbsGrams: number;
+
+  mealsPerDayType: '3' | '3+1' | '4' | '5' | 'custom';
+  customMealsPerDay?: number;
+
+  macroDistributionType:
+    | 'equal'
+    | 'around-workout'
+    | 'more-evening-carbs'
+    | 'low-carb-breakfast'
+    | 'custom';
+  customMacroDistribution?: string;
+
+  wakeUpTime: string;
+  sleepTime: string;
+  hasTraining: boolean;
+  trainingTime?: string;
+  workProgram?: 'fixed' | 'shifts' | 'flexible' | 'mostly-home';
+
+  mealLocations: ('home' | 'office' | 'delivery' | 'canteen' | 'on-the-go')[];
+  cookingLevel: 'daily' | 'meal-prep' | 'rare' | 'almost-never';
+  foodBudget: 'low' | 'medium' | 'high';
+
+  dietaryRestrictions: (
+    | 'lactose-free'
+    | 'gluten-free'
+    | 'vegetarian'
+    | 'vegan'
+    | 'intermittent-fasting'
+    | 'religious-fasting'
+    | 'allergies'
+  )[];
+  allergiesDetails?: string;
+  excludedFoodsAndPreferences?: string;
+
+  planStyle:
+    | 'exact-grams'
+    | 'macros-plus-examples'
+    | 'flexible-template'
+    | 'full-day-with-alternatives';
+}
+
+export interface NutritionMealFood {
+  food: string;
+  grams: number;
+  protein: number;
+  fat: number;
+  carbs: number;
+  calories: number;
+  notes?: string;
+}
+
+export interface NutritionMeal {
+  name: string;
+  time: string;
+  targetMacros: {
+    protein: number;
+    fat: number;
+    carbs: number;
+    calories: number;
+  };
+  foods: NutritionMealFood[];
+}
+
+export interface NutritionPlanResult {
+  summary: string;
+  dailyTotals: {
+    calories: number;
+    protein: number;
+    fat: number;
+    carbs: number;
+  };
+  mealsPerDay: number;
+  schedule: NutritionMeal[];
+  alternatives: {
+    forMeal: string;
+    options: string[];
+  }[];
+  prepTips: string[];
+  complianceRules: string[];
+}
+
+function getMealsPerDay(input: GenerateClientNutritionPlanInput): number {
+  if (input.mealsPerDayType === 'custom') {
+    return input.customMealsPerDay || 3;
+  }
+
+  if (input.mealsPerDayType === '3+1') {
+    return 4;
+  }
+
+  return Number(input.mealsPerDayType);
+}
+
+export async function generateClientNutritionPlan(
+  input: GenerateClientNutritionPlanInput
+): Promise<NutritionPlanResult> {
+  const mealsPerDay = getMealsPerDay(input);
+
+  const prompt = `Tu ești un nutriționist sportiv senior pentru clienți fitness.
+
+Generează un plan alimentar zilnic care respectă STRICT valorile totale introduse.
+
+Planul alimentar trebuie să respecte următoarele principii:
+- Include o varietate mare de alimente.
+- Evită repetarea excesivă a acelorași ingrediente sau combinații de mese.
+- Sursele de macronutrienți trebuie să fie variate între mese.
+- Mesele principale trebuie să fie echilibrate nutrițional.
+- Planul alimentar trebuie să includă diferite tipuri de preparate și structuri de mese.
+- Mesele trebuie să fie simple, realiste și ușor de pregătit.
+- Planul alimentar trebuie să respecte toate datele introduse de utilizator, inclusiv obiectivul, necesarul caloric și distribuția macronutrienților.
+La fiecare generare, creează un plan alimentar nou și variat.
+Evită reutilizarea acelorași tipare de meniu sau a acelorași combinații alimentare din planurile generate anterior.
+
+DATE CLIENT:
+- Calorii: ${input.calories}
+- Proteină (g): ${input.proteinGrams}
+- Grăsimi (g): ${input.fatGrams}
+- Carbohidrați (g): ${input.carbsGrams}
+- Mese/zi: ${mealsPerDay}
+- Distribuție macro: ${input.macroDistributionType}${input.customMacroDistribution ? ` | custom: ${input.customMacroDistribution}` : ''}
+- Trezire: ${input.wakeUpTime}
+- Culcare: ${input.sleepTime}
+- Se antrenează: ${input.hasTraining ? 'da' : 'nu'}
+- Ora antrenament: ${input.trainingTime || 'N/A'}
+- Program lucru: ${input.workProgram || 'Nespecificat'}
+- Unde mănâncă: ${input.mealLocations.join(', ')}
+- Nivel gătit: ${input.cookingLevel}
+- Buget: ${input.foodBudget}
+- Restricții: ${input.dietaryRestrictions.length ? input.dietaryRestrictions.join(', ') : 'fără'}
+- Alergii detalii: ${input.allergiesDetails || 'N/A'}
+- Alimente excluse/preferințe: ${input.excludedFoodsAndPreferences || 'N/A'}
+- Stil plan: ${input.planStyle}
+
+REGULĂ OBLIGATORIE:
+1) Respectă strict totalurile:
+   - calories = ${input.calories}
+   - protein = ${input.proteinGrams}
+   - fat = ${input.fatGrams}
+   - carbs = ${input.carbsGrams}
+2) Nu modifica aceste valori.
+3) Ajustează distribuția pe mese astfel încât suma finală să fie EXACTĂ (rotunjire ±1 permisă pe fiecare macro și calorii).
+4) Folosește alimente realiste pentru contextul clientului (program, buget, gătit, restricții).
+5) Evită alimentele din restricții / preferințe excluse.
+6) Fiecare masă trebuie să conțină:
+   - target macro masă
+   - lista alimentelor cu gramaj și macro estimat.
+
+Răspunde DOAR JSON valid, fără markdown:
+{
+  "summary": "2-4 propoziții în limba română",
+  "dailyTotals": {
+    "calories": ${input.calories},
+    "protein": ${input.proteinGrams},
+    "fat": ${input.fatGrams},
+    "carbs": ${input.carbsGrams}
+  },
+  "mealsPerDay": ${mealsPerDay},
+  "schedule": [
+    {
+      "name": "Masa 1",
+      "time": "08:00",
+      "targetMacros": { "protein": 40, "fat": 15, "carbs": 55, "calories": 515 },
+      "foods": [
+        {
+          "food": "aliment",
+          "grams": 100,
+          "protein": 10,
+          "fat": 5,
+          "carbs": 20,
+          "calories": 165,
+          "notes": "optional"
+        }
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "forMeal": "Masa 1",
+      "options": ["variantă 1", "variantă 2"]
+    }
+  ],
+  "prepTips": ["sfat 1", "sfat 2", "sfat 3"],
+  "complianceRules": ["regulă 1", "regulă 2", "regulă 3"]
+}`;
+
+  const content = (await generateAnthropicText(prompt, 0.35, 2600)) || '{}';
+  const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+  const parsed = JSON.parse(cleaned);
+
+  return {
+    summary: parsed.summary || '',
+    dailyTotals: {
+      calories: Number(parsed?.dailyTotals?.calories ?? input.calories),
+      protein: Number(parsed?.dailyTotals?.protein ?? input.proteinGrams),
+      fat: Number(parsed?.dailyTotals?.fat ?? input.fatGrams),
+      carbs: Number(parsed?.dailyTotals?.carbs ?? input.carbsGrams),
+    },
+    mealsPerDay: Number(parsed.mealsPerDay ?? mealsPerDay),
+    schedule: Array.isArray(parsed.schedule) ? parsed.schedule : [],
+    alternatives: Array.isArray(parsed.alternatives) ? parsed.alternatives : [],
+    prepTips: Array.isArray(parsed.prepTips) ? parsed.prepTips : [],
+    complianceRules: Array.isArray(parsed.complianceRules) ? parsed.complianceRules : [],
+  };
+}
+
+export default {
+  generateNicheQuick,
+  generateNicheQuickICP,
+  generateNicheWizard,
+  generateNicheVariants,
+  generateNicheDiscover,
+  generateICPDay,
+  generateDailyIdea,
+  generateMultiFormatIdea,
+  structureUserIdea,
+  analyzeFeedback,
+  analyzeTextContent,
+  generateMarketingEmail,
+  generateClientNutritionPlan,
+};

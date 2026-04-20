@@ -1,0 +1,267 @@
+// TrainerOS Database Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== USER & AUTH ====================
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String
+  name          String?
+  isEmailVerified Boolean @default(false) @map("emailVerified")
+  emailVerificationTokenHash String?
+  emailVerificationTokenExpiresAt DateTime?
+  passwordResetTokenHash String?
+  passwordResetTokenExpiresAt DateTime?
+  
+  // Admin flag (bypasses all limits)
+  isAdmin       Boolean  @default(false)
+  
+  // Subscription
+  plan          Plan     @default(FREE_TRIAL)
+  planExpiresAt DateTime?
+  trialEndsAt   DateTime?
+  promoCode     String?  // Applied promo code
+  
+  // Niche & ICP (from Niche Finder)
+  niche         String?
+  icpProfile    Json?    // Ideal Client Profile
+  positioningMessage String?
+  
+  // Content Creation Preferences
+  contentPreferences Json? // How they want to create content
+  
+  // Brand Kit (Elite tier)
+  brandKit      Json?
+  toneOfVoice   String?
+  
+  // Usage tracking
+  ideasGeneratedThisMonth Int @default(0)
+  feedbacksThisMonth      Int @default(0)
+  lastIdeaGeneratedAt     DateTime?
+  lastLoginAt             DateTime?
+  
+  // Relations
+  ideas         Idea[]
+  feedbacks     Feedback[]
+  calendar      CalendarEntry[]
+  emailGenerations EmailGeneration[]
+  nutritionGenerations NutritionGeneration[]
+  ideaStructureGenerations IdeaStructureGeneration[]
+  chatMessageUsages ChatMessageUsage[]
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  @@index([email])
+  @@index([plan])
+  @@index([emailVerificationTokenHash])
+  @@index([passwordResetTokenHash])
+}
+
+enum Plan {
+  FREE_TRIAL
+  STARTER
+  PRO
+  ELITE
+  MAX
+}
+
+// ==================== DAILY IDEAS ====================
+
+model Idea {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  date          DateTime @default(now())
+
+  // Multi-format grouping (reel + carousel + story from same generation)
+  groupId       String?
+  
+  // Content metadata
+  format        Format   // REEL, CAROUSEL, STORY
+  hook          String   @db.Text
+  script        Json     // Array of {scene: number, text: string, visual: string}
+  cta           String   @db.Text
+  objective     String   // "Generare lead-uri", "Engagement", etc.
+  conversionRate Float?  // Expected conversion rate boost (e.g., 47.5 for +47%)
+  
+  // Lead magnet details
+  leadMagnet    String?
+  dmKeyword     String?  // Keyword pentru DM (e.g., "PLAN")
+  
+  // AI reasoning
+  reasoning     String   @db.Text // Why this idea works
+  
+  // User interaction
+  used          Boolean  @default(false)
+  savedToCalendar Boolean @default(false)
+  rating        Int?     // 1-5 stars (optional user feedback)
+  
+  createdAt     DateTime @default(now())
+  
+  @@index([userId, date])
+  @@index([userId, groupId])
+}
+
+enum Format {
+  REEL
+  CAROUSEL
+  STORY
+}
+
+// ==================== CONTENT FEEDBACK ====================
+
+model Feedback {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // File upload
+  fileUrl       String
+  fileType      String   // "video", "image", "text"
+  fileName      String
+  duration      Int?     // Video duration in seconds
+  
+  // Whisper transcription (for videos)
+  transcription String?  @db.Text // Audio transcription from Whisper
+  
+  // AI Scores (0-100)
+  clarityScore     Int
+  relevanceScore   Int
+  trustScore       Int
+  ctaScore         Int
+  overallScore     Int
+  
+  // AI Suggestions
+  suggestions   Json     // Array of {type: "error"|"warning"|"success", category: string, text: string}
+  summary       String   @db.Text
+  
+  // User action
+  applied       Boolean  @default(false) // Did user apply suggestions?
+  
+  createdAt     DateTime @default(now())
+  
+  @@index([userId, createdAt])
+}
+
+// ==================== CONTENT CALENDAR ====================
+
+model CalendarEntry {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  date          DateTime
+  ideaId        String?  // Optional link to generated idea
+  
+  title         String
+  description   String?  @db.Text
+  format        Format
+  status        Status   @default(PLANNED)
+  
+  notes         String?  @db.Text
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  @@index([userId, date])
+}
+
+enum Status {
+  PLANNED
+  POSTED
+  SKIPPED
+}
+
+// ==================== PROMO CODES ====================
+
+model PromoCode {
+  id            String   @id @default(cuid())
+  code          String   @unique
+  
+  // Discount details
+  discountType  DiscountType // PERCENTAGE or FIXED
+  discountValue Float    // 33 for 33% off, or 5 for $5 off
+  finalPrice    Float?   // Optional: override price completely (e.g., 9.99)
+  
+  // Validity
+  isActive      Boolean  @default(true)
+  maxUses       Int?     // null = unlimited
+  usedCount     Int      @default(0)
+  expiresAt     DateTime?
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  @@index([code])
+}
+
+model EmailGeneration {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  topic         String
+  objective     String
+  emailType     String
+  tone          String
+  language      String
+
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model NutritionGeneration {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  calories      Int
+  proteinGrams  Float
+  fatGrams      Float
+  carbsGrams    Float
+  mealsPerDay   Int
+
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model IdeaStructureGeneration {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  ideaText      String   @db.Text
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model ChatMessageUsage {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  message       String   @db.Text
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED
+  OVERRIDE
+}

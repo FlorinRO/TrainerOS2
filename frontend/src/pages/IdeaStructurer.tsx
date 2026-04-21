@@ -32,6 +32,15 @@ function normalizeTextValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function normalizeLooseComparisonText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 function collectStructuredIdeaText(value: unknown): string[] {
   if (typeof value === 'string') {
     const normalized = value.trim();
@@ -84,13 +93,23 @@ function normalizeStructuredIdeaTitle(value: unknown): string {
   }
 
   const source = value as Record<string, unknown>;
-  return (
+  const rawTitle =
     normalizeTextValue(source.sectionTitle) ||
     normalizeTextValue(source.title) ||
     normalizeTextValue(source.heading) ||
     normalizeTextValue(source.name) ||
-    normalizeTextValue(source.label)
+    normalizeTextValue(source.label);
+
+  if (!rawTitle) {
+    return '';
+  }
+
+  const normalizedRawTitle = normalizeLooseComparisonText(rawTitle);
+  const matchedDefaultTitle = DEFAULT_SECTION_TITLES.find((title) =>
+    normalizedRawTitle.startsWith(normalizeLooseComparisonText(title))
   );
+
+  return matchedDefaultTitle || rawTitle;
 }
 
 function normalizeSectionText(section: Record<string, unknown>): string {

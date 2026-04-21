@@ -1180,13 +1180,63 @@ function normalizeStructuredIdeaTitle(value: unknown): string {
   }
 
   const source = value as Record<string, unknown>;
-  return (
+  const rawTitle =
     normalizeTextValue(source.sectionTitle) ||
     normalizeTextValue(source.title) ||
     normalizeTextValue(source.heading) ||
     normalizeTextValue(source.name) ||
-    normalizeTextValue(source.label)
+    normalizeTextValue(source.label);
+
+  if (!rawTitle) {
+    return '';
+  }
+
+  const normalizedRawTitle = normalizeLooseComparisonText(rawTitle);
+  const matchedDefaultTitle = STRUCTURED_IDEA_SECTION_TITLES.find((title) =>
+    normalizedRawTitle.startsWith(normalizeLooseComparisonText(title))
   );
+
+  return matchedDefaultTitle || rawTitle;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripStructuredIdeaSectionHeading(text: string, title: string): string {
+  let cleaned = text.trim();
+  const escapedTitle = escapeRegExp(title);
+  const headingPattern = new RegExp(
+    `^${escapedTitle}(?:\\s*,[^\\n]*)?(?:\\r?\\n|\\s*[:\\-–]\\s*)?`,
+    'i'
+  );
+
+  for (let i = 0; i < 2; i += 1) {
+    const next = cleaned.replace(headingPattern, '').trim();
+    if (next === cleaned) {
+      break;
+    }
+    cleaned = next;
+  }
+
+  return cleaned;
+}
+
+function sanitizeStructuredIdeaSectionText(text: string, title: string): string {
+  return stripStructuredIdeaSectionHeading(normalizeTextValue(text), title);
+}
+
+function sanitizeStructuredIdeaScriptSections(
+  script: StructuredIdeaSection[]
+): StructuredIdeaSection[] {
+  return script.map((section, index) => {
+    const sectionTitle = section.sectionTitle || STRUCTURED_IDEA_SECTION_TITLES[index] || `PARTEA ${index + 1}`;
+    return {
+      ...section,
+      sectionTitle,
+      text: sanitizeStructuredIdeaSectionText(section.text, sectionTitle),
+    };
+  });
 }
 
 function normalizeStructuredIdeaScript(value: unknown): StructuredIdeaSection[] {
@@ -1206,13 +1256,15 @@ function normalizeStructuredIdeaScript(value: unknown): StructuredIdeaSection[] 
 
   return rawScript.map((part, index) => {
     const textParts = collectStructuredIdeaText(part);
+    const sectionTitle =
+      normalizeStructuredIdeaTitle(part) ||
+      STRUCTURED_IDEA_SECTION_TITLES[index] ||
+      `PARTEA ${index + 1}`;
+    const text = sanitizeStructuredIdeaSectionText(textParts.join('\n\n').trim(), sectionTitle);
 
     return {
-      sectionTitle:
-        normalizeStructuredIdeaTitle(part) ||
-        STRUCTURED_IDEA_SECTION_TITLES[index] ||
-        `PARTEA ${index + 1}`,
-      text: textParts.join('\n\n').trim(),
+      sectionTitle,
+      text,
     };
   });
 }
@@ -1282,12 +1334,16 @@ function looksLikeTruncatedStructuredText(value: string): boolean {
     return true;
   }
 
-  if (text.length < 80) {
-    return false;
+  if (/[([{]$/.test(text)) {
+    return true;
   }
 
   if (/[.?!:;"')\]]$/.test(text)) {
     return false;
+  }
+
+  if (text.length < 80) {
+    return text.split(/\s+/).length < 16;
   }
 
   const lastWord = text.split(/\s+/).pop() || '';
@@ -1337,6 +1393,45 @@ type StructuredIdeaBlockKey =
   | 'section3'
   | 'section4'
   | 'cta';
+
+function getStructuredIdeaWeakBlocks(
+  parsed: Partial<Record<StructuredIdeaBlockKey, string>>
+): StructuredIdeaBlockKey[] {
+  const weakBlocks: StructuredIdeaBlockKey[] = [];
+
+  if (!parsed.mainIdea || looksLikeStructuredIdeaPlaceholder(parsed.mainIdea)) {
+    weakBlocks.push('mainIdea');
+  }
+
+  if (!parsed.hook1 || looksLikeStructuredIdeaPlaceholder(parsed.hook1) || looksLikeWeakStructuredHook(parsed.hook1)) {
+    weakBlocks.push('hook1');
+  }
+
+  if (!parsed.hook2 || looksLikeStructuredIdeaPlaceholder(parsed.hook2) || looksLikeWeakStructuredHook(parsed.hook2)) {
+    weakBlocks.push('hook2');
+  }
+
+  (['section1', 'section2', 'section3', 'section4'] as StructuredIdeaBlockKey[]).forEach((key) => {
+    const sectionIndex = Number(key.replace('section', '')) - 1;
+    const sectionTitle = STRUCTURED_IDEA_SECTION_TITLES[sectionIndex] || `PARTEA ${sectionIndex + 1}`;
+    const text = sanitizeStructuredIdeaSectionText(parsed[key] || '', sectionTitle);
+    if (
+      !text ||
+      looksLikeStructuredIdeaPlaceholder(text) ||
+      looksLikeStructuredIdeaMetaText(text) ||
+      looksLikeTruncatedStructuredText(text) ||
+      text.split(/\s+/).length < 40
+    ) {
+      weakBlocks.push(key);
+    }
+  });
+
+  if (!parsed.cta || looksLikeStructuredIdeaPlaceholder(parsed.cta)) {
+    weakBlocks.push('cta');
+  }
+
+  return weakBlocks;
+}
 
 function parseStructuredIdeaDelimitedContent(
   content: string,
@@ -1919,12 +2014,12 @@ function rescueStructuredIdeaResultFromPartial(
   return {
     ...rescued,
     hooks: repairedHooks,
-    script: [
+    script: sanitizeStructuredIdeaScriptSections([
       { ...rescued.script[0], text: repairedSection1 },
       { ...rescued.script[1], text: repairedSection2 },
       { ...rescued.script[2], text: repairedSection3 },
       { ...rescued.script[3], text: rescuedSection4 },
-    ],
+    ]),
     cta: rescued.cta || buildStructuredIdeaRescueCta(parsed.mainIdea || '', fallbackCtaStyle),
   };
 }
@@ -1997,7 +2092,16 @@ function acceptStructuredIdeaResultFromFullAiBlocks(
         : buildStructuredIdeaRescueCta(parsed.mainIdea || '', fallbackCtaStyle),
   };
 
-  return repaired;
+  const sanitized = {
+    ...repaired,
+    script: sanitizeStructuredIdeaScriptSections(repaired.script),
+  };
+
+  if (sanitized.script.some((section) => looksLikeTruncatedStructuredText(section.text) || section.text.trim().split(/\s+/).length < 40)) {
+    return null;
+  }
+
+  return sanitized;
 }
 
 function buildStructuredIdeaEmergencyResult(input: StructureUserIdeaInput): StructuredIdeaResult {
@@ -3818,10 +3922,13 @@ ${buildStructuredIdeaDelimitedFormatInstructions(targets)}`;
       );
       console.warn(`Structured idea raw preview: ${previewModelResponse(primaryContent)}`);
 
+      const weakBlocks = getStructuredIdeaWeakBlocks(parsed);
       const retryTargets =
         missing.length > 0
           ? missing
-          : (['mainIdea', 'hook1', 'hook2', 'section1', 'section2', 'section3', 'section4', 'cta'] as StructuredIdeaBlockKey[]);
+          : weakBlocks.length > 0
+            ? weakBlocks
+            : (['mainIdea', 'hook1', 'hook2', 'section1', 'section2', 'section3', 'section4', 'cta'] as StructuredIdeaBlockKey[]);
       const retryContent = await generateDelimitedResponse(
         retryTargets,
         `Lipseau sau erau slabe blocurile: ${retryTargets.join(', ')}. Refă doar aceste blocuri ca text final, natural și coerent.`
@@ -3863,11 +3970,13 @@ ${buildStructuredIdeaDelimitedFormatInstructions(targets)}`;
         return acceptedFullAiResult;
       }
 
-      const rescued = rescueStructuredIdeaResultFromPartial(parsed, ctaStyle);
-      if (rescued) {
-        console.warn('Structured idea AI result was missing only weak/non-critical blocks; rescued result without full fallback.');
-        console.log(`🧩 Structured idea rescued from AI path with hooks: "${rescued.hooks[0]}" | "${rescued.hooks[1]}"`);
-        return rescued;
+      if (missing.length > 0) {
+        const rescued = rescueStructuredIdeaResultFromPartial(parsed, ctaStyle);
+        if (rescued) {
+          console.warn('Structured idea AI result was missing only weak/non-critical blocks; rescued result without full fallback.');
+          console.log(`🧩 Structured idea rescued from AI path with hooks: "${rescued.hooks[0]}" | "${rescued.hooks[1]}"`);
+          return rescued;
+        }
       }
     }
 

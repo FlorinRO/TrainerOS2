@@ -3,6 +3,12 @@ import * as openaiService from '../services/openai.service.js';
 import { prisma } from '../lib/prisma.js';
 import { z } from 'zod';
 import { getPlanLimits } from '../config/planLimits.js';
+import {
+  acquireGenerationLock,
+  buildGenerationConflictPayload,
+  releaseGenerationLock,
+} from '../lib/generation-lock.js';
+import { generateUniqueResult } from '../lib/generation-history.js';
 
 const generateIdeaSchema = z.object({
   objective: z.enum(['lead-gen', 'engagement', 'education']).optional(),
@@ -26,8 +32,10 @@ export async function generate(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    const user = req.user;
+
     // Check if user has niche set
-    if (!req.user.niche) {
+    if (!user.niche) {
       res.status(400).json({
         error: 'Niche not set',
         message: '🎯 Oprește! Trebuie să-ți setezi nișa înainte de a genera idei. Mergi la Niche Finder și completează profilul (2 minute).',
@@ -36,8 +44,10 @@ export async function generate(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    const niche = user.niche;
+
     // Check plan limits (skip for admins)
-    if (!req.user.isAdmin) {
+    if (!user.isAdmin) {
       const monthStart = new Date();
       monthStart.setDate(1);
       monthStart.setHours(0, 0, 0, 0);
@@ -47,12 +57,12 @@ export async function generate(req: Request, res: Response): Promise<void> {
 
       const ideasThisMonth = await prisma.idea.count({
         where: {
-          userId: req.user.id,
+          userId: user.id,
           createdAt: { gte: monthStart, lt: nextMonthStart },
         },
       });
 
-      const limits = getPlanLimits(req.user.plan);
+      const limits = getPlanLimits(user.plan);
       const monthlyIdeaEntriesLimit = limits.ideaSetsPerMonth * 3;
       if (ideasThisMonth >= monthlyIdeaEntriesLimit) {
         res.status(403).json({
@@ -64,51 +74,85 @@ export async function generate(req: Request, res: Response): Promise<void> {
     }
 
     const data = generateIdeaSchema.parse(req.body);
+    const generationKey = acquireGenerationLock(user.id, 'daily-idea');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('daily-idea'));
+      return;
+    }
 
-    const recentIdeas = await prisma.idea.findMany({
-      where: { userId: req.user.id },
-      orderBy: { createdAt: 'desc' },
-      take: RECENT_IDEA_CONTEXT_LIMIT,
-      select: {
-        format: true,
-        hook: true,
-        cta: true,
-        createdAt: true,
-      },
-    });
+    try {
+      const recentIdeas = await prisma.idea.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: RECENT_IDEA_CONTEXT_LIMIT,
+        select: {
+          format: true,
+          hook: true,
+          script: true,
+          cta: true,
+          objective: true,
+          conversionRate: true,
+          leadMagnet: true,
+          dmKeyword: true,
+          reasoning: true,
+          createdAt: true,
+        },
+      });
 
-    const recentIdeaContext = recentIdeas.map((idea) => ({
-      format: idea.format || 'UNKNOWN',
-      hook: idea.hook || '',
-      cta: idea.cta || '',
-      createdAt: idea.createdAt.toISOString(),
-    }));
+      const recentIdeaContext = recentIdeas.map((idea) => ({
+        format: idea.format || 'UNKNOWN',
+        hook: idea.hook || '',
+        cta: idea.cta || '',
+        createdAt: idea.createdAt.toISOString(),
+      }));
 
-    const result = await openaiService.generateDailyIdea({
-      niche: req.user.niche,
-      icpProfile: req.user.icpProfile,
-      contentPreferences: req.user.contentPreferences,
-      objective: data.objective,
-      recentIdeas: recentIdeaContext,
-    });
+      const result = await generateUniqueResult({
+        userId: user.id,
+        section: 'daily-idea',
+        persistentValues: recentIdeas.map((idea) => ({
+          format: idea.format,
+          hook: idea.hook,
+          script: idea.script,
+          cta: idea.cta,
+          objective: idea.objective,
+          conversionRate: idea.conversionRate,
+          leadMagnet: idea.leadMagnet,
+          dmKeyword: idea.dmKeyword,
+          reasoning: idea.reasoning,
+        })),
+        generate: ({ recentOutputs, duplicateAttempt }) => openaiService.generateDailyIdea({
+          niche,
+          icpProfile: user.icpProfile,
+          contentPreferences: user.contentPreferences,
+          objective: data.objective,
+          recentIdeas: recentIdeaContext,
+          generationContext: {
+            recentOutputs,
+            duplicateAttempt,
+          },
+        }),
+      });
 
-    // Save idea to database
-    const idea = await prisma.idea.create({
-      data: {
-        userId: req.user.id,
-        format: result.format,
-        hook: result.hook,
-        script: result.script as any,
-        cta: result.cta,
-        objective: result.objective,
-        conversionRate: result.conversionRate,
-        leadMagnet: result.leadMagnet,
-        dmKeyword: result.dmKeyword,
-        reasoning: result.reasoning,
-      },
-    });
+      // Save idea to database
+      const idea = await prisma.idea.create({
+        data: {
+          userId: user.id,
+          format: result.format,
+          hook: result.hook,
+          script: result.script as any,
+          cta: result.cta,
+          objective: result.objective,
+          conversionRate: result.conversionRate,
+          leadMagnet: result.leadMagnet,
+          dmKeyword: result.dmKeyword,
+          reasoning: result.reasoning,
+        },
+      });
 
-    res.json({ ...result, id: idea.id });
+      res.json({ ...result, id: idea.id });
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     console.error('generateMultiFormat failed:', error);
     if (error instanceof z.ZodError) {
@@ -126,11 +170,12 @@ export async function generateMultiFormat(req: Request, res: Response): Promise<
       return;
     }
 
+    const user = req.user;
     const data = generateMultiFormatSchema.parse(req.body ?? {});
     const useGeneralIdea = data.general === true;
     const ideaNiche = useGeneralIdea
       ? 'fitness general pentru adulți din România care vor rezultate sustenabile'
-      : req.user.niche;
+      : user.niche;
 
     // Check if user has niche unless the user explicitly requests a general idea
     if (!ideaNiche) {
@@ -141,120 +186,156 @@ export async function generateMultiFormat(req: Request, res: Response): Promise<
       return;
     }
 
-    // Check monthly set limit by plan (skip for admins)
-    if (!req.user.isAdmin) {
-      const monthStart = new Date();
-      monthStart.setDate(1);
-      monthStart.setHours(0, 0, 0, 0);
+    const generationKey = acquireGenerationLock(user.id, 'daily-idea');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('daily-idea'));
+      return;
+    }
 
-      const nextMonthStart = new Date(monthStart);
-      nextMonthStart.setMonth(nextMonthStart.getMonth() + 1);
+    try {
 
-      const generationsThisMonth = await prisma.idea.count({
-        where: {
-          userId: req.user.id,
-          createdAt: {
-            gte: monthStart,
-            lt: nextMonthStart,
+      // Check monthly set limit by plan (skip for admins)
+      if (!user.isAdmin) {
+        const monthStart = new Date();
+        monthStart.setDate(1);
+        monthStart.setHours(0, 0, 0, 0);
+
+        const nextMonthStart = new Date(monthStart);
+        nextMonthStart.setMonth(nextMonthStart.getMonth() + 1);
+
+        const generationsThisMonth = await prisma.idea.count({
+          where: {
+            userId: user.id,
+            createdAt: {
+              gte: monthStart,
+              lt: nextMonthStart,
+            },
           },
+        });
+
+        const multiFormatCallsThisMonth = Math.floor(generationsThisMonth / 3);
+        const monthlySetLimit = getPlanLimits(user.plan).ideaSetsPerMonth;
+
+        if (multiFormatCallsThisMonth >= monthlySetLimit) {
+          res.status(429).json({
+            error: 'Monthly limit reached',
+            message: `Ai atins limita de ${monthlySetLimit} seturi Daily Idea pe luna curentă.`,
+            generationsThisMonth: multiFormatCallsThisMonth,
+            limit: monthlySetLimit,
+          });
+          return;
+        }
+      }
+
+      const recentIdeas = await prisma.idea.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: RECENT_IDEA_CONTEXT_LIMIT,
+        select: {
+          format: true,
+          hook: true,
+          script: true,
+          cta: true,
+          objective: true,
+          conversionRate: true,
+          leadMagnet: true,
+          dmKeyword: true,
+          reasoning: true,
+          createdAt: true,
         },
       });
 
-      const multiFormatCallsThisMonth = Math.floor(generationsThisMonth / 3);
-      const monthlySetLimit = getPlanLimits(req.user.plan).ideaSetsPerMonth;
+      const recentIdeaContext = recentIdeas.map((idea) => ({
+        format: idea.format || 'UNKNOWN',
+        hook: idea.hook || '',
+        cta: idea.cta || '',
+        createdAt: idea.createdAt.toISOString(),
+      }));
 
-      if (multiFormatCallsThisMonth >= monthlySetLimit) {
-        res.status(429).json({
-          error: 'Monthly limit reached',
-          message: `Ai atins limita de ${monthlySetLimit} seturi Daily Idea pe luna curentă.`,
-          generationsThisMonth: multiFormatCallsThisMonth,
-          limit: monthlySetLimit,
-        });
-        return;
-      }
+      // Generate multi-format ideas
+      const result = await generateUniqueResult({
+        userId: user.id,
+        section: 'daily-idea',
+        persistentValues: recentIdeas.map((idea) => ({
+          format: idea.format,
+          hook: idea.hook,
+          script: idea.script,
+          cta: idea.cta,
+          objective: idea.objective,
+          conversionRate: idea.conversionRate,
+          leadMagnet: idea.leadMagnet,
+          dmKeyword: idea.dmKeyword,
+          reasoning: idea.reasoning,
+        })),
+        generate: ({ recentOutputs, duplicateAttempt }) => openaiService.generateMultiFormatIdea({
+          niche: ideaNiche,
+          icpProfile: useGeneralIdea ? undefined : user.icpProfile,
+          contentPreferences: user.contentPreferences,
+          objective: 'lead-gen',
+          recentIdeas: recentIdeaContext,
+          general: useGeneralIdea,
+          generationContext: {
+            recentOutputs,
+            duplicateAttempt,
+          },
+        }),
+      });
+
+      // Save all 3 ideas to database
+      const ideas = await Promise.all([
+        prisma.idea.create({
+          data: {
+            userId: user.id,
+            format: result.reel.format,
+            hook: result.reel.hook,
+            script: result.reel.script as any,
+            cta: result.reel.cta,
+            objective: result.reel.objective,
+            conversionRate: result.reel.conversionRate,
+            leadMagnet: result.reel.leadMagnet,
+            dmKeyword: result.reel.dmKeyword,
+            reasoning: result.reel.reasoning,
+          },
+        }),
+        prisma.idea.create({
+          data: {
+            userId: user.id,
+            format: result.carousel.format,
+            hook: result.carousel.hook,
+            script: result.carousel.script as any,
+            cta: result.carousel.cta,
+            objective: result.carousel.objective,
+            conversionRate: result.carousel.conversionRate,
+            leadMagnet: result.carousel.leadMagnet,
+            dmKeyword: result.carousel.dmKeyword,
+            reasoning: result.carousel.reasoning,
+          },
+        }),
+        prisma.idea.create({
+          data: {
+            userId: user.id,
+            format: result.story.format,
+            hook: result.story.hook,
+            script: result.story.script as any,
+            cta: result.story.cta,
+            objective: result.story.objective,
+            conversionRate: result.story.conversionRate,
+            leadMagnet: result.story.leadMagnet,
+            dmKeyword: result.story.dmKeyword,
+            reasoning: result.story.reasoning,
+          },
+        }),
+      ]);
+
+      res.json({
+        reel: { ...result.reel, id: ideas[0].id },
+        carousel: { ...result.carousel, id: ideas[1].id },
+        story: { ...result.story, id: ideas[2].id },
+        source: result.source || 'ai',
+      });
+    } finally {
+      releaseGenerationLock(generationKey);
     }
-
-    const recentIdeas = await prisma.idea.findMany({
-      where: { userId: req.user.id },
-      orderBy: { createdAt: 'desc' },
-      take: RECENT_IDEA_CONTEXT_LIMIT,
-      select: {
-        format: true,
-        hook: true,
-        cta: true,
-        createdAt: true,
-      },
-    });
-
-    const recentIdeaContext = recentIdeas.map((idea) => ({
-      format: idea.format || 'UNKNOWN',
-      hook: idea.hook || '',
-      cta: idea.cta || '',
-      createdAt: idea.createdAt.toISOString(),
-    }));
-
-    // Generate multi-format ideas
-    const result = await openaiService.generateMultiFormatIdea({
-      niche: ideaNiche,
-      icpProfile: useGeneralIdea ? undefined : req.user.icpProfile,
-      contentPreferences: req.user.contentPreferences,
-      objective: 'lead-gen',
-      recentIdeas: recentIdeaContext,
-      general: useGeneralIdea,
-    });
-
-    // Save all 3 ideas to database
-    const ideas = await Promise.all([
-      prisma.idea.create({
-        data: {
-          userId: req.user.id,
-          format: result.reel.format,
-          hook: result.reel.hook,
-          script: result.reel.script as any,
-          cta: result.reel.cta,
-          objective: result.reel.objective,
-          conversionRate: result.reel.conversionRate,
-          leadMagnet: result.reel.leadMagnet,
-          dmKeyword: result.reel.dmKeyword,
-          reasoning: result.reel.reasoning,
-        },
-      }),
-      prisma.idea.create({
-        data: {
-          userId: req.user.id,
-          format: result.carousel.format,
-          hook: result.carousel.hook,
-          script: result.carousel.script as any,
-          cta: result.carousel.cta,
-          objective: result.carousel.objective,
-          conversionRate: result.carousel.conversionRate,
-          leadMagnet: result.carousel.leadMagnet,
-          dmKeyword: result.carousel.dmKeyword,
-          reasoning: result.carousel.reasoning,
-        },
-      }),
-      prisma.idea.create({
-        data: {
-          userId: req.user.id,
-          format: result.story.format,
-          hook: result.story.hook,
-          script: result.story.script as any,
-          cta: result.story.cta,
-          objective: result.story.objective,
-          conversionRate: result.story.conversionRate,
-          leadMagnet: result.story.leadMagnet,
-          dmKeyword: result.story.dmKeyword,
-          reasoning: result.story.reasoning,
-        },
-      }),
-    ]);
-
-    res.json({
-      reel: { ...result.reel, id: ideas[0].id },
-      carousel: { ...result.carousel, id: ideas[1].id },
-      story: { ...result.story, id: ideas[2].id },
-      source: result.source || 'ai',
-    });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });
@@ -346,7 +427,9 @@ export async function structure(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    if (!req.user.niche) {
+    const user = req.user;
+
+    if (!user.niche) {
       res.status(400).json({
         error: 'Niche not set',
         message: 'Completează Niche Finder înainte să structurezi ideea.',
@@ -355,7 +438,9 @@ export async function structure(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    if (!req.user.isAdmin) {
+    const niche = user.niche;
+
+    if (!user.isAdmin) {
       const monthStart = new Date();
       monthStart.setDate(1);
       monthStart.setHours(0, 0, 0, 0);
@@ -365,7 +450,7 @@ export async function structure(req: Request, res: Response): Promise<void> {
 
       const structuredThisMonth = await prismaAny.ideaStructureGeneration.count({
         where: {
-          userId: req.user.id,
+          userId: user.id,
           createdAt: {
             gte: monthStart,
             lt: nextMonthStart,
@@ -373,7 +458,7 @@ export async function structure(req: Request, res: Response): Promise<void> {
         },
       });
 
-      const monthlyStructureLimit = getPlanLimits(req.user.plan).structuredIdeasPerMonth;
+      const monthlyStructureLimit = getPlanLimits(user.plan).structuredIdeasPerMonth;
       if (structuredThisMonth >= monthlyStructureLimit) {
         res.status(429).json({
           error: 'Monthly structure limit reached',
@@ -386,20 +471,38 @@ export async function structure(req: Request, res: Response): Promise<void> {
     }
 
     const data = structureIdeaSchema.parse(req.body);
-    const result = await openaiService.structureUserIdea({
-      ideaText: data.ideaText,
-      niche: req.user.niche,
-      contentPreferences: req.user.contentPreferences,
-    });
+    const generationKey = acquireGenerationLock(user.id, 'idea-structurer');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('idea-structurer'));
+      return;
+    }
 
-    await prismaAny.ideaStructureGeneration.create({
-      data: {
-        userId: req.user.id,
-        ideaText: data.ideaText,
-      },
-    });
+    try {
+      const result = await generateUniqueResult({
+        userId: user.id,
+        section: 'idea-structurer',
+        generate: ({ recentOutputs, duplicateAttempt }) => openaiService.structureUserIdea({
+          ideaText: data.ideaText,
+          niche,
+          contentPreferences: user.contentPreferences,
+          generationContext: {
+            recentOutputs,
+            duplicateAttempt,
+          },
+        }),
+      });
 
-    res.json(result);
+      await prismaAny.ideaStructureGeneration.create({
+        data: {
+          userId: user.id,
+          ideaText: data.ideaText,
+        },
+      });
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });

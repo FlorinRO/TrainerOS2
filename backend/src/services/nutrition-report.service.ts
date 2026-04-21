@@ -3,6 +3,8 @@ import { createWriteStream, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createGeminiText } from '../lib/gemini.js';
+import type { GenerationPromptContext } from '../lib/generation-history.js';
+import { buildAntiRepeatPromptSection } from '../lib/generation-history.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -91,6 +93,7 @@ export interface GenerateNutritionReportInput {
   allergiesDetails?: string;
   excludedFoodsAndPreferences?: string;
   planStyle: 'exact-grams' | 'macros-plus-examples' | 'flexible-template' | 'full-day-with-alternatives';
+  generationContext?: GenerationPromptContext;
 }
 
 export interface NutritionReportResult {
@@ -655,6 +658,7 @@ export async function generateNutritionReport(
   const mealsPerDay = getMealsPerDay(input);
   const styleConfig = getPlanStyleConfig(input.planStyle);
   const pools = buildIngredientPools(input);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
 
   const prompt = `Ești un nutriționist senior și redactezi în limba română un raport complet, premium, branduit TrainerOS.org, inspirat din structura unui "Calorie, Macro and Portion Guide".
 
@@ -725,6 +729,8 @@ ${styleConfig.promptRules.map((rule) => `- ${rule}`).join('\n')}
   * Variante rapide/utile pentru context: ${pools.convenience.join(', ')}
 - Respectă strict restricțiile și alimentele excluse. Dacă un aliment nu se potrivește stilului sau preferințelor, nu-l include.
 - Fă fiecare secțiune să reflecte profilul clientului: program, nivel de gătit, buget, locațiile în care mănâncă și obiectivul urmărit.
+
+${antiRepeatSection}
 
 Returnează DOAR JSON valid, cu structura exactă:
 {

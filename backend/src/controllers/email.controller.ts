@@ -3,6 +3,12 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
 import * as openaiService from '../services/openai.service.js';
 import { getPlanLimits } from '../config/planLimits.js';
+import {
+  acquireGenerationLock,
+  buildGenerationConflictPayload,
+  releaseGenerationLock,
+} from '../lib/generation-lock.js';
+import { generateUniqueResult } from '../lib/generation-history.js';
 
 const generateEmailSchema = z.object({
   topic: z.string().min(5).max(300),
@@ -22,79 +28,97 @@ export async function generateEmail(req: Request, res: Response): Promise<void> 
       return;
     }
 
+    const userSession = req.user;
     const payload = generateEmailSchema.parse(req.body);
+    const generationKey = acquireGenerationLock(userSession.id, 'email-marketing');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('email-marketing'));
+      return;
+    }
 
-    if (!req.user.isAdmin) {
-      const monthlyEmailLimit = getPlanLimits(req.user.plan).emailsPerMonth;
-      const monthStart = new Date();
-      monthStart.setDate(1);
-      monthStart.setHours(0, 0, 0, 0);
+    try {
+      if (!userSession.isAdmin) {
+        const monthlyEmailLimit = getPlanLimits(userSession.plan).emailsPerMonth;
+        const monthStart = new Date();
+        monthStart.setDate(1);
+        monthStart.setHours(0, 0, 0, 0);
 
-      const nextMonthStart = new Date(monthStart);
-      nextMonthStart.setMonth(nextMonthStart.getMonth() + 1);
+        const nextMonthStart = new Date(monthStart);
+        nextMonthStart.setMonth(nextMonthStart.getMonth() + 1);
 
-      const emailsGeneratedThisMonth = await prisma.emailGeneration.count({
-        where: {
-          userId: req.user.id,
-          createdAt: {
-            gte: monthStart,
-            lt: nextMonthStart,
+        const emailsGeneratedThisMonth = await prisma.emailGeneration.count({
+          where: {
+            userId: userSession.id,
+            createdAt: {
+              gte: monthStart,
+              lt: nextMonthStart,
+            },
           },
+        });
+
+        if (emailsGeneratedThisMonth >= monthlyEmailLimit) {
+          res.status(429).json({
+            error: 'Monthly email limit reached',
+            message: `Ai atins limita de ${monthlyEmailLimit} emailuri generate pe luna curentă.`,
+            generatedThisMonth: emailsGeneratedThisMonth,
+            limit: monthlyEmailLimit,
+          });
+          return;
+        }
+      }
+
+      const user = await prisma.user.findUnique({
+        where: { id: userSession.id },
+        select: {
+          name: true,
+          niche: true,
+          icpProfile: true,
+          positioningMessage: true,
+          contentPreferences: true,
         },
       });
 
-      if (emailsGeneratedThisMonth >= monthlyEmailLimit) {
-        res.status(429).json({
-          error: 'Monthly email limit reached',
-          message: `Ai atins limita de ${monthlyEmailLimit} emailuri generate pe luna curentă.`,
-          generatedThisMonth: emailsGeneratedThisMonth,
-          limit: monthlyEmailLimit,
-        });
-        return;
-      }
+      const result = await generateUniqueResult({
+        userId: userSession.id,
+        section: 'email-marketing',
+        generate: ({ recentOutputs, duplicateAttempt }) => openaiService.generateMarketingEmail({
+          topic: payload.topic,
+          objective: payload.objective,
+          emailType: payload.emailType,
+          tone: payload.tone,
+          offer: payload.offer,
+          audiencePain: payload.audiencePain,
+          ctaGoal: payload.ctaGoal,
+          language: payload.language,
+          generationContext: {
+            recentOutputs,
+            duplicateAttempt,
+          },
+          userContext: {
+            name: user?.name || userSession.name || '',
+            niche: user?.niche || userSession.niche || '',
+            icpProfile: user?.icpProfile || userSession.icpProfile || '',
+            positioningMessage: user?.positioningMessage || userSession.positioningMessage || '',
+            contentPreferences: user?.contentPreferences || userSession.contentPreferences || null,
+          },
+        }),
+      });
+
+      await prisma.emailGeneration.create({
+        data: {
+          userId: userSession.id,
+          topic: payload.topic,
+          objective: payload.objective,
+          emailType: payload.emailType,
+          tone: payload.tone,
+          language: payload.language,
+        },
+      });
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
     }
-
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.id },
-      select: {
-        name: true,
-        niche: true,
-        icpProfile: true,
-        positioningMessage: true,
-        contentPreferences: true,
-      },
-    });
-
-    const result = await openaiService.generateMarketingEmail({
-      topic: payload.topic,
-      objective: payload.objective,
-      emailType: payload.emailType,
-      tone: payload.tone,
-      offer: payload.offer,
-      audiencePain: payload.audiencePain,
-      ctaGoal: payload.ctaGoal,
-      language: payload.language,
-      userContext: {
-        name: user?.name || req.user.name || '',
-        niche: user?.niche || req.user.niche || '',
-        icpProfile: user?.icpProfile || req.user.icpProfile || '',
-        positioningMessage: user?.positioningMessage || req.user.positioningMessage || '',
-        contentPreferences: user?.contentPreferences || req.user.contentPreferences || null,
-      },
-    });
-
-    await prisma.emailGeneration.create({
-      data: {
-        userId: req.user.id,
-        topic: payload.topic,
-        objective: payload.objective,
-        emailType: payload.emailType,
-        tone: payload.tone,
-        language: payload.language,
-      },
-    });
-
-    res.json(result);
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });

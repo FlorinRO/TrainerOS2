@@ -3,6 +3,12 @@ import * as openaiService from '../services/openai.service.js';
 import { prisma } from '../lib/prisma.js';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
+import {
+  acquireGenerationLock,
+  buildGenerationConflictPayload,
+  releaseGenerationLock,
+} from '../lib/generation-lock.js';
+import { generateUniqueResult } from '../lib/generation-history.js';
 
 const quickNicheSchema = z.object({
   quickNiche: z.string().min(5),
@@ -152,6 +158,30 @@ const contentPreferencesSchema = z.object({
   { message: 'At least one preferences section is required.' },
 );
 
+function acquireNicheLockOrRespond(req: Request, res: Response): string | null {
+  const generationKey = acquireGenerationLock(req.user!.id, 'niche');
+  if (!generationKey) {
+    res.status(409).json(buildGenerationConflictPayload('niche'));
+    return null;
+  }
+
+  return generationKey;
+}
+
+function buildCurrentNicheSnapshot(req: Request): Array<Record<string, unknown>> {
+  if (!req.user || (!req.user.niche && !req.user.icpProfile && !req.user.positioningMessage)) {
+    return [];
+  }
+
+  return [
+    {
+      niche: req.user.niche || '',
+      idealClient: req.user.icpProfile || '',
+      positioning: req.user.positioningMessage || '',
+    },
+  ];
+}
+
 export async function generateQuick(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
@@ -160,21 +190,42 @@ export async function generateQuick(req: Request, res: Response): Promise<void> 
     }
 
     const data = quickNicheSchema.parse(req.body);
-    const result = await openaiService.generateNicheQuick(data);
-
-    // Save to user profile
-    if (data.saveToProfile) {
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: {
-          niche: result.niche,
-          icpProfile: result.idealClient,
-          positioningMessage: result.positioning,
-        },
-      });
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
     }
 
-    res.json(result);
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-quick',
+        persistentValues: buildCurrentNicheSnapshot(req),
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generateNicheQuick({
+            ...data,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
+
+      // Save to user profile
+      if (data.saveToProfile) {
+        await prisma.user.update({
+          where: { id: req.user.id },
+          data: {
+            niche: result.niche,
+            icpProfile: result.idealClient,
+            positioningMessage: result.positioning,
+          },
+        });
+      }
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });
@@ -192,25 +243,43 @@ export async function savePresetNicheSelection(req: Request, res: Response): Pro
     }
 
     const data = presetNicheSelectionSchema.parse(req.body);
-    const generatedProfile = await openaiService.generateNicheQuick({
-      quickNiche: data.niche,
-    });
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
+    }
 
-    await prisma.user.update({
-      where: { id: req.user.id },
-      data: {
+    try {
+      const generatedProfile = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-quick',
+        persistentValues: buildCurrentNicheSnapshot(req),
+        generate: ({ recentOutputs, duplicateAttempt }) => openaiService.generateNicheQuick({
+          quickNiche: data.niche,
+          generationContext: {
+            recentOutputs,
+            duplicateAttempt,
+          },
+        }),
+      });
+
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: {
+          niche: data.niche,
+          icpProfile: generatedProfile.idealClient || Prisma.JsonNull,
+          positioningMessage: generatedProfile.positioning || data.description || null,
+        },
+      });
+
+      res.json({
+        message: 'Preset niche saved successfully',
         niche: data.niche,
-        icpProfile: generatedProfile.idealClient || Prisma.JsonNull,
-        positioningMessage: generatedProfile.positioning || data.description || null,
-      },
-    });
-
-    res.json({
-      message: 'Preset niche saved successfully',
-      niche: data.niche,
-      idealClient: generatedProfile.idealClient,
-      positioning: generatedProfile.positioning,
-    });
+        idealClient: generatedProfile.idealClient,
+        positioning: generatedProfile.positioning,
+      });
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });
@@ -228,21 +297,42 @@ export async function generateWizard(req: Request, res: Response): Promise<void>
     }
 
     const data = wizardNicheSchema.parse(req.body);
-    const result = await openaiService.generateNicheWizard(data);
-
-    // Save to user profile
-    if (data.saveToProfile) {
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: {
-          niche: result.niche,
-          icpProfile: result.idealClient,
-          positioningMessage: result.positioning,
-        },
-      });
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
     }
 
-    res.json(result);
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-wizard',
+        persistentValues: buildCurrentNicheSnapshot(req),
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generateNicheWizard({
+            ...data,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
+
+      // Save to user profile
+      if (data.saveToProfile) {
+        await prisma.user.update({
+          where: { id: req.user.id },
+          data: {
+            niche: result.niche,
+            icpProfile: result.idealClient,
+            positioningMessage: result.positioning,
+          },
+        });
+      }
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });
@@ -260,21 +350,42 @@ export async function generateDiscover(req: Request, res: Response): Promise<voi
     }
 
     const data = discoverNicheSchema.parse(req.body);
-    const result = await openaiService.generateNicheDiscover(data);
-
-    // Save to user profile
-    if (data.saveToProfile) {
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: {
-          niche: result.niche,
-          icpProfile: result.idealClient,
-          positioningMessage: result.positioning,
-        },
-      });
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
     }
 
-    res.json(result);
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-discover',
+        persistentValues: buildCurrentNicheSnapshot(req),
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generateNicheDiscover({
+            ...data,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
+
+      // Save to user profile
+      if (data.saveToProfile) {
+        await prisma.user.update({
+          where: { id: req.user.id },
+          data: {
+            niche: result.niche,
+            icpProfile: result.idealClient,
+            positioningMessage: result.positioning,
+          },
+        });
+      }
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });
@@ -292,17 +403,38 @@ export async function generateICPDay(req: Request, res: Response): Promise<void>
     }
 
     const data = icpDaySchema.parse(req.body);
-    const result = await openaiService.generateICPDay(data);
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
+    }
 
-    // Save ICP profile to user
-    await prisma.user.update({
-      where: { id: req.user.id },
-      data: {
-        icpProfile: result.icpProfile,
-      },
-    });
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-icp-day',
+        persistentValues: req.user.icpProfile ? [{ icpProfile: req.user.icpProfile }] : [],
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generateICPDay({
+            ...data,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
 
-    res.json(result);
+      // Save ICP profile to user
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: {
+          icpProfile: result.icpProfile,
+        },
+      });
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });
@@ -320,9 +452,29 @@ export async function generateNicheVariants(req: Request, res: Response): Promis
     }
 
     const data = nicheVariantsSchema.parse(req.body);
-    const result = await openaiService.generateNicheVariants(data);
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
+    }
 
-    res.json(result);
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-variants',
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generateNicheVariants({
+            ...data,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });
@@ -339,9 +491,26 @@ export async function generatePresetNiches(req: Request, res: Response): Promise
       return;
     }
 
-    const result = await openaiService.generatePresetNicheOptions();
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
+    }
 
-    res.json(result);
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-preset-options',
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generatePresetNicheOptions({
+            recentOutputs,
+            duplicateAttempt,
+          }),
+      });
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to generate preset niches' });
   }
@@ -355,21 +524,42 @@ export async function generateQuickICP(req: Request, res: Response): Promise<voi
     }
 
     const data = quickICPSchema.parse(req.body);
-    const result = await openaiService.generateNicheQuickICP(data);
-
-    // Save to user profile
-    if (data.saveToProfile) {
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: {
-          niche: result.niche,
-          icpProfile: result.idealClient,
-          positioningMessage: result.positioning,
-        },
-      });
+    const generationKey = acquireNicheLockOrRespond(req, res);
+    if (!generationKey) {
+      return;
     }
 
-    res.json(result);
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'niche-quick-icp',
+        persistentValues: buildCurrentNicheSnapshot(req),
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generateNicheQuickICP({
+            ...data,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
+
+      // Save to user profile
+      if (data.saveToProfile) {
+        await prisma.user.update({
+          where: { id: req.user.id },
+          data: {
+            niche: result.niche,
+            icpProfile: result.idealClient,
+            positioningMessage: result.positioning,
+          },
+        });
+      }
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Validation error', details: error.errors });

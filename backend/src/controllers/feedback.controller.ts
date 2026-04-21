@@ -6,6 +6,12 @@ import path from 'path';
 import fs from 'fs';
 import { getPlanLimits } from '../config/planLimits.js';
 import { extractAudioFromVideo } from '../lib/ffmpeg.js';
+import {
+  acquireGenerationLock,
+  buildGenerationConflictPayload,
+  releaseGenerationLock,
+} from '../lib/generation-lock.js';
+import { generateUniqueResult } from '../lib/generation-history.js';
 
 async function checkContentReviewLimit(req: Request, res: Response): Promise<boolean> {
   if (!req.user || req.user.isAdmin) {
@@ -63,8 +69,10 @@ export async function analyze(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    const user = req.user;
+
     // Check if user has niche (optional but recommended)
-    if (!req.user.niche) {
+    if (!user.niche) {
       // Allow but warn
       console.log('⚠️ User analyzing content without niche set');
     }
@@ -79,6 +87,14 @@ export async function analyze(req: Request, res: Response): Promise<void> {
     if (!canProceed) {
       return;
     }
+
+    const generationKey = acquireGenerationLock(user.id, 'content-review');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('content-review'));
+      return;
+    }
+
+    try {
     const fileType = req.file.mimetype.startsWith('video') ? 'video' : 'image';
     const fileUrl = `/uploads/${req.file.filename}`;
     const filePath = path.join(process.cwd(), 'uploads', req.file.filename);
@@ -128,8 +144,8 @@ export async function analyze(req: Request, res: Response): Promise<void> {
     console.log(`🤖 Step 4: Preparing analysis...`);
     console.log(`📊 Analysis input:`, {
       fileType,
-      hasNiche: !!req.user.niche,
-      niche: req.user.niche,
+      hasNiche: !!user.niche,
+      niche: user.niche,
       hasTranscription: !!transcription,
       transcriptionLength: transcription?.length || 0,
     });
@@ -137,13 +153,38 @@ export async function analyze(req: Request, res: Response): Promise<void> {
     if (fileType === 'video' && !transcription) {
       console.error('⚠️ WARNING: Video analysis without transcription!');
     }
-    
-    const result = await openaiService.analyzeFeedback({
-      fileType,
-      fileUrl,
-      duration,
-      niche: req.user.niche || undefined,
-      transcription,
+
+    const recentFeedbacks = await prisma.feedback.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+      select: {
+        clarityScore: true,
+        relevanceScore: true,
+        trustScore: true,
+        ctaScore: true,
+        overallScore: true,
+        suggestions: true,
+        summary: true,
+        transcription: true,
+      },
+    });
+
+    const result = await generateUniqueResult({
+      userId: user.id,
+      section: 'content-review',
+      persistentValues: recentFeedbacks,
+      generate: ({ recentOutputs, duplicateAttempt }) => openaiService.analyzeFeedback({
+        fileType,
+        fileUrl,
+        duration,
+        niche: user.niche || undefined,
+        transcription,
+        generationContext: {
+          recentOutputs,
+          duplicateAttempt,
+        },
+      }),
     });
     
     console.log(`✅ Step 5: Analysis complete!`);
@@ -152,7 +193,7 @@ export async function analyze(req: Request, res: Response): Promise<void> {
     // Save feedback to database
     const feedback = await prisma.feedback.create({
       data: {
-        userId: req.user.id,
+        userId: user.id,
         fileUrl,
         fileType,
         fileName: req.file.originalname,
@@ -169,6 +210,9 @@ export async function analyze(req: Request, res: Response): Promise<void> {
     });
 
     res.json({ ...result, id: feedback.id });
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     console.error('❌ Content analysis error:', error);
     console.error('❌ Error stack:', error.stack);
@@ -205,6 +249,7 @@ export async function analyzeText(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    const user = req.user;
     const canProceed = await checkContentReviewLimit(req, res);
     if (!canProceed) {
       return;
@@ -217,47 +262,80 @@ export async function analyzeText(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    console.log(`📝 Analyzing ${format || 'text'} content for user ${req.user.email}...`);
+    const generationKey = acquireGenerationLock(user.id, 'content-review');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('content-review'));
+      return;
+    }
 
-    // Get full user profile for personalized analysis
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.id },
-      select: {
-        niche: true,
-        icpProfile: true,
-        positioningMessage: true,
-        toneOfVoice: true,
-      },
-    });
+    try {
+      console.log(`📝 Analyzing ${format || 'text'} content for user ${user.email}...`);
 
-    // Use Anthropic to analyze text content
-    const result = await openaiService.analyzeTextContent({
-      text,
-      format: format || 'general',
-      niche: user?.niche || undefined,
-      icpProfile: user?.icpProfile as any,
-      positioningMessage: user?.positioningMessage || undefined,
-      toneOfVoice: user?.toneOfVoice || undefined,
-    });
+      // Get full user profile for personalized analysis
+      const profile = await prisma.user.findUnique({
+        where: { id: user.id },
+        select: {
+          niche: true,
+          icpProfile: true,
+          positioningMessage: true,
+          toneOfVoice: true,
+        },
+      });
 
-    // Save feedback to database
-    const feedback = await prisma.feedback.create({
-      data: {
-        userId: req.user.id,
-        fileUrl: '',
-        fileType: 'text',
-        fileName: `${format || 'text'}-analysis`,
-        clarityScore: result.clarityScore,
-        relevanceScore: result.relevanceScore,
-        trustScore: result.trustScore,
-        ctaScore: result.ctaScore,
-        overallScore: result.overallScore,
-        suggestions: result.suggestions as any,
-        summary: result.summary,
-      },
-    });
+      const recentFeedbacks = await prisma.feedback.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+        select: {
+          clarityScore: true,
+          relevanceScore: true,
+          trustScore: true,
+          ctaScore: true,
+          overallScore: true,
+          suggestions: true,
+          summary: true,
+        },
+      });
 
-    res.json({ ...result, id: feedback.id });
+      const result = await generateUniqueResult({
+        userId: user.id,
+        section: 'content-review',
+        persistentValues: recentFeedbacks,
+        generate: ({ recentOutputs, duplicateAttempt }) => openaiService.analyzeTextContent({
+          text,
+          format: format || 'general',
+          niche: profile?.niche || undefined,
+          icpProfile: profile?.icpProfile as any,
+          positioningMessage: profile?.positioningMessage || undefined,
+          toneOfVoice: profile?.toneOfVoice || undefined,
+          generationContext: {
+            recentOutputs,
+            duplicateAttempt,
+          },
+        }),
+      });
+
+      // Save feedback to database
+      const feedback = await prisma.feedback.create({
+        data: {
+          userId: user.id,
+          fileUrl: '',
+          fileType: 'text',
+          fileName: `${format || 'text'}-analysis`,
+          clarityScore: result.clarityScore,
+          relevanceScore: result.relevanceScore,
+          trustScore: result.trustScore,
+          ctaScore: result.ctaScore,
+          overallScore: result.overallScore,
+          suggestions: result.suggestions as any,
+          summary: result.summary,
+        },
+      });
+
+      res.json({ ...result, id: feedback.id });
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     console.error('❌ Text analysis failed:', error);
     res.status(500).json({ error: error.message || 'Failed to analyze text content' });

@@ -9,6 +9,12 @@ import {
 } from '../services/nutrition-report.service.js';
 import { sendNutritionReportEmail } from '../services/email.service.js';
 import { getPlanLimits } from '../config/planLimits.js';
+import {
+  acquireGenerationLock,
+  buildGenerationConflictPayload,
+  releaseGenerationLock,
+} from '../lib/generation-lock.js';
+import { generateUniqueResult } from '../lib/generation-history.js';
 
 const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const prismaAny = prisma as any;
@@ -220,11 +226,32 @@ export async function generateNutritionPlan(req: Request, res: Response): Promis
     await ensureNutritionAllowance(req);
 
     const payload = generateNutritionSchema.parse(req.body);
-    const result = await openaiService.generateClientNutritionPlan(payload);
+    const generationKey = acquireGenerationLock(req.user.id, 'nutrition');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('nutrition'));
+      return;
+    }
 
-    await recordNutritionGeneration(req.user.id, payload);
+    try {
+      const result = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'nutrition-plan',
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          openaiService.generateClientNutritionPlan({
+            ...payload,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
 
-    res.json(result);
+      await recordNutritionGeneration(req.user.id, payload);
+
+      res.json(result);
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({
@@ -255,33 +282,54 @@ export async function generateNutritionReportPdfAndEmail(req: Request, res: Resp
     await ensureNutritionAllowance(req);
 
     const payload = generateNutritionReportSchema.parse(req.body) as GenerateNutritionReportInput;
-    const report = await generateNutritionReport(payload);
-    const pdf = await createNutritionReportPdf(payload, report);
+    const generationKey = acquireGenerationLock(req.user.id, 'nutrition');
+    if (!generationKey) {
+      res.status(409).json(buildGenerationConflictPayload('nutrition'));
+      return;
+    }
 
-    await sendNutritionReportEmail({
-      to: req.user.email,
-      recipientName: req.user.name ?? null,
-      clientName: payload.clientName,
-      pdfFilename: pdf.filename,
-      pdfContentBase64: pdf.buffer.toString('base64'),
-      downloadUrl: pdf.publicUrl,
-    });
+    try {
+      const report = await generateUniqueResult({
+        userId: req.user.id,
+        section: 'nutrition-report',
+        generate: ({ recentOutputs, duplicateAttempt }) =>
+          generateNutritionReport({
+            ...payload,
+            generationContext: {
+              recentOutputs,
+              duplicateAttempt,
+            },
+          }),
+      });
+      const pdf = await createNutritionReportPdf(payload, report);
 
-    await recordNutritionGeneration(req.user.id, payload);
+      await sendNutritionReportEmail({
+        to: req.user.email,
+        recipientName: req.user.name ?? null,
+        clientName: payload.clientName,
+        pdfFilename: pdf.filename,
+        pdfContentBase64: pdf.buffer.toString('base64'),
+        downloadUrl: pdf.publicUrl,
+      });
 
-    res.json({
-      message: `Raportul PDF a fost generat și trimis la ${req.user.email}.`,
-      emailedTo: req.user.email,
-      pdfUrl: pdf.publicUrl,
-      filename: pdf.filename,
-      reportPreview: {
-        title: report.reportTitle,
-        summary: report.executiveSummary,
-        calorieTarget: payload.calories,
-        macroSummary: `P ${payload.proteinGrams} g | F ${payload.fatGrams} g | C ${payload.carbsGrams} g`,
-        mealsPerDay: getMealsPerDay(payload),
-      },
-    });
+      await recordNutritionGeneration(req.user.id, payload);
+
+      res.json({
+        message: `Raportul PDF a fost generat și trimis la ${req.user.email}.`,
+        emailedTo: req.user.email,
+        pdfUrl: pdf.publicUrl,
+        filename: pdf.filename,
+        reportPreview: {
+          title: report.reportTitle,
+          summary: report.executiveSummary,
+          calorieTarget: payload.calories,
+          macroSummary: `P ${payload.proteinGrams} g | F ${payload.fatGrams} g | C ${payload.carbsGrams} g`,
+          mealsPerDay: getMealsPerDay(payload),
+        },
+      });
+    } finally {
+      releaseGenerationLock(generationKey);
+    }
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       res.status(400).json({

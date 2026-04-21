@@ -11,6 +11,7 @@ const GENERAL_IDEA_NICHE_PROMPT_SHOWN_KEY = 'daily-idea-niche-prompt-shown';
 
 export default function DailyIdea() {
   const outputRef = useRef<HTMLDivElement | null>(null);
+  const generationLockRef = useRef(false);
   const navigate = useNavigate();
   const [generationMode, setGenerationMode] = useState<'niche' | 'general'>('niche');
   const [showNichePrompt, setShowNichePrompt] = useState(false);
@@ -30,6 +31,9 @@ export default function DailyIdea() {
   const generateMutation = useMutation({
     mutationFn: (mode: 'niche' | 'general') =>
       ideaAPI.generateMultiFormat({ general: mode === 'general' }),
+    onSettled: () => {
+      generationLockRef.current = false;
+    },
   });
 
   const [activeTab, setActiveTab] = useState<'reel' | 'carousel' | 'story'>('reel');
@@ -42,7 +46,12 @@ export default function DailyIdea() {
   const activeIdea = generatedIdeas?.[activeTab];
 
   const handleGenerate = (mode: 'niche' | 'general') => {
+    if (generationLockRef.current || generateMutation.isPending) {
+      return;
+    }
+
     setGenerationMode(mode);
+    generationLockRef.current = true;
     generateMutation.mutate(mode);
   };
 

@@ -1,6 +1,8 @@
 import OpenAI from 'openai';
 import { createReadStream, readFileSync } from 'fs';
 import { GEMINI_MODEL, createGeminiPartsText, createGeminiText } from '../lib/gemini.js';
+import type { GenerationPromptContext } from '../lib/generation-history.js';
+import { buildAntiRepeatPromptSection } from '../lib/generation-history.js';
 
 let transcriptionClient: OpenAI | null = null;
 
@@ -275,6 +277,7 @@ async function parseModelJson<T>(content: string | null | undefined): Promise<T>
 
 export interface NicheFinderQuickInput {
   quickNiche: string;
+  generationContext?: GenerationPromptContext;
 }
 
 export interface NicheQuickICPInput {
@@ -296,6 +299,7 @@ export interface NicheQuickICPInput {
   primaryReason?: string;
   differentiation?: string;
   internalObjections?: string[];
+  generationContext?: GenerationPromptContext;
 }
 
 export interface NicheFinderWizardInput {
@@ -304,6 +308,7 @@ export interface NicheFinderWizardInput {
   q3: string; // Ce rezultate poți demonstra?
   q4: string; // Ce tip de client vrei să eviți?
   q5: string; // De ce te-ar alege pe tine?
+  generationContext?: GenerationPromptContext;
 }
 
 export interface NicheResult {
@@ -627,6 +632,7 @@ function ensureCompleteNicheResult(
 }
 
 export async function generateNicheQuick(input: NicheFinderQuickInput): Promise<NicheResult> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const prompt = `Tu ești un expert în marketing fitness. Analizează această nișă și creează:
 
 1. Nișa clară și specifică (1 propoziție precisă)
@@ -634,6 +640,8 @@ export async function generateNicheQuick(input: NicheFinderQuickInput): Promise<
 3. Mesaj de poziționare (1-2 propoziții, unique value proposition)
 
 Nișa introdusă: "${input.quickNiche}"
+
+${antiRepeatSection}
 
 Răspunde DOAR în format JSON strict, fără markdown.
 IMPORTANT:
@@ -654,6 +662,7 @@ FORMAT:
 }
 
 export async function generateNicheQuickICP(input: NicheQuickICPInput): Promise<NicheResult> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const prompt = `Tu ești un expert în marketing fitness. Pe baza descrierii clientului ideal, creează:
 
 1. Nișa clară și specifică (1 propoziție precisă)
@@ -681,6 +690,8 @@ ${input.physicalJobIssue?.length ? `\n🏗️ Probleme job fizic: ${input.physic
 ${input.painDetails?.length ? `\n🩹 Dureri/limitări: ${input.painDetails.join(', ')}` : ''}
 ${input.differentiation ? `\n🟦 Diferențiere antrenor: ${input.differentiation}` : ''}
 ${input.internalObjections?.length ? `\n⚠️ Obiecții interne: ${input.internalObjections.join(', ')}` : ''}
+
+${antiRepeatSection}
 
 IMPORTANT: Pentru "idealClient", scrie un profil COMPLET (4-5 paragrafe) care combină:
 - Demografic (gen, vârstă)
@@ -725,6 +736,7 @@ FORMAT:
 }
 
 export async function generateNicheWizard(input: NicheFinderWizardInput): Promise<NicheResult> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const prompt = `Tu ești un expert în marketing fitness. Pe baza răspunsurilor antrenorului, creează:
 
 1. Nișa clară și specifică (1 propoziție precisă)
@@ -737,6 +749,8 @@ Răspunsuri antrenor:
 3. Rezultate pe care le pot demonstra: "${input.q3}"
 4. Tip de client pe care vreau să-l evit: "${input.q4}"
 5. De ce m-ar alege pe mine: "${input.q5}"
+
+${antiRepeatSection}
 
 Răspunde DOAR în format JSON strict, fără markdown.
 IMPORTANT:
@@ -773,6 +787,7 @@ export interface DailyIdeaInput {
   contentPreferences?: any;
   objective?: 'lead-gen' | 'engagement' | 'education';
   general?: boolean;
+  generationContext?: GenerationPromptContext;
   recentIdeas?: {
     format: string;
     hook: string;
@@ -820,6 +835,13 @@ export interface StructuredIdeaResult {
   improvements: string[];
 }
 
+interface StructureUserIdeaInput {
+  ideaText: string;
+  niche: string;
+  contentPreferences?: any;
+  generationContext?: GenerationPromptContext;
+}
+
 const STRUCTURED_IDEA_SECTION_TITLES = [
   'PARTEA 1 – Context',
   'PARTEA 2 – Explicație clară',
@@ -836,6 +858,15 @@ const STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS = [
 
 function normalizeTextValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeLooseComparisonText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
 function normalizeNumericValue(value: unknown, fallback = 0): number {
@@ -888,6 +919,99 @@ function normalizeDailyIdeaScript(value: unknown): Scene[] {
       };
     })
     .filter((scene): scene is Scene => scene !== null);
+}
+
+function looksLikeDailyIdeaCtaLikeText(value: string, cta: string, keyword: string): boolean {
+  const normalizedValue = normalizeLooseComparisonText(value);
+  if (!normalizedValue) {
+    return false;
+  }
+
+  const normalizedCta = normalizeLooseComparisonText(cta);
+  const normalizedKeyword = normalizeLooseComparisonText(keyword);
+
+  if (normalizedCta && normalizedValue === normalizedCta) {
+    return true;
+  }
+
+  const ctaSignals = [
+    'scrie ',
+    'comenteaza ',
+    'trimite ',
+    'lasa ',
+    'da-mi ',
+    'swipe up',
+    'in dm',
+    ' dm ',
+  ];
+
+  const hasDirectSignal = ctaSignals.some((signal) => normalizedValue.includes(signal));
+  const referencesKeyword = normalizedKeyword ? normalizedValue.includes(normalizedKeyword) : false;
+  const promisesDelivery =
+    normalizedValue.includes('iti trimit') ||
+    normalizedValue.includes('ti-o trimit') ||
+    normalizedValue.includes('ti o trimit') ||
+    normalizedValue.includes('iti dau') ||
+    normalizedValue.includes('primesti');
+
+  return hasDirectSignal || (referencesKeyword && promisesDelivery);
+}
+
+function buildDailyIdeaFinalSceneText(expectedFormat: DailyIdeaResult['format']): string {
+  if (expectedFormat === 'CAROUSEL') {
+    return 'Concluzia practică este simplă: nu încerca să schimbi totul dintr-odată. Alege ideea cea mai ușor de aplicat din slide-urile anterioare, testeaz-o câteva zile la rând și urmărește ce se schimbă în energie, postură sau consecvență. Așa construiești progres real, nu doar entuziasm de moment.';
+  }
+
+  if (expectedFormat === 'STORY') {
+    return 'Ține minte ideea principală: un pas mic, repetat constant, îți dă rezultate mai bune decât un restart mare pe care nu reușești să-l susții până la capăt.';
+  }
+
+  return 'Concluzia utilă este asta: nu ai nevoie să faci totul perfect din prima. Alege un singur pas clar din ce ai văzut aici, repetă-l câteva zile la rând și lasă consecvența să facă diferența în corpul și energia ta.';
+}
+
+function buildDailyIdeaFinalSceneVisual(expectedFormat: DailyIdeaResult['format']): string {
+  if (expectedFormat === 'CAROUSEL') {
+    return 'Slide final cu concluzia practică evidențiată clar pe ecran';
+  }
+
+  if (expectedFormat === 'STORY') {
+    return 'Cadru simplu cu ideea-cheie afișată mare pe ecran';
+  }
+
+  return 'Cadru final cu concluzia practică afișată clar pe ecran';
+}
+
+function sanitizeDailyIdeaScript(
+  script: Scene[],
+  expectedFormat: DailyIdeaResult['format'],
+  cta: string,
+  keyword: string
+): Scene[] {
+  if (script.length === 0) {
+    return script;
+  }
+
+  const lastSceneIndex = script.length - 1;
+  const lastScene = script[lastSceneIndex];
+  const lastSceneText = normalizeTextValue(lastScene.text);
+  const lastSceneVisual = normalizeTextValue(lastScene.visual);
+  const shouldRewriteLastScene =
+    looksLikeDailyIdeaCtaLikeText(lastSceneText, cta, keyword) ||
+    looksLikeDailyIdeaCtaLikeText(lastSceneVisual, cta, keyword);
+
+  if (!shouldRewriteLastScene) {
+    return script;
+  }
+
+  return script.map((scene, index) =>
+    index === lastSceneIndex
+      ? {
+          ...scene,
+          text: buildDailyIdeaFinalSceneText(expectedFormat),
+          visual: buildDailyIdeaFinalSceneVisual(expectedFormat),
+        }
+      : scene
+  );
 }
 
 function buildDailyIdeaDefaultKeyword(expectedFormat: DailyIdeaResult['format']): string {
@@ -948,10 +1072,15 @@ function normalizeDailyIdeaResult(
 
   const source = value as Record<string, unknown>;
   const hook = normalizeTextValue(source.hook);
-  const script = normalizeDailyIdeaScript(source.script ?? source.scenes ?? source.slides);
   const format = normalizeTextValue(source.format).toUpperCase() || expectedFormat;
   const keyword = normalizeTextValue(source.dmKeyword) || buildDailyIdeaDefaultKeyword(expectedFormat);
   const cta = normalizeTextValue(source.cta) || buildDailyIdeaDefaultCta(expectedFormat, keyword);
+  const script = sanitizeDailyIdeaScript(
+    normalizeDailyIdeaScript(source.script ?? source.scenes ?? source.slides),
+    expectedFormat,
+    cta,
+    keyword
+  );
   const reasoning = normalizeTextValue(source.reasoning) || buildDailyIdeaDefaultReasoning(expectedFormat);
   const leadMagnet = normalizeTextValue(source.leadMagnet) || buildDailyIdeaDefaultLeadMagnet(expectedFormat);
 
@@ -1108,6 +1237,68 @@ function looksLikeStructuredIdeaPlaceholder(value: string): boolean {
   );
 }
 
+function looksLikeStructuredIdeaMetaText(value: string): boolean {
+  const normalized = normalizeLooseComparisonText(value);
+  if (!normalized) {
+    return true;
+  }
+
+  const metaSignals = [
+    'ideea trebuie',
+    'mesajul trebuie',
+    'partea aceasta',
+    'partea asta',
+    'in partea de',
+    'poti lua o situatie',
+    'trebuie sa numesti',
+    'trebuie sa explici',
+    'important este sa explici',
+    'la final ideea trebuie',
+    'raportat la',
+    'pleci de la ideea ta',
+    'ca sa devina memorabil',
+  ];
+
+  return metaSignals.some((signal) => normalized.includes(signal));
+}
+
+function looksLikeWeakStructuredHook(hook: string): boolean {
+  const normalized = normalizeLooseComparisonText(hook);
+  if (!normalized) {
+    return true;
+  }
+
+  return (
+    normalized.startsWith('de ce vreau sa vorbesc') ||
+    normalized.startsWith('vreau sa vorbesc despre') ||
+    normalized.includes('mai multa energie si echilibru pentru') ||
+    normalized.split(/\s+/).length > 18
+  );
+}
+
+function looksLikeTruncatedStructuredText(value: string): boolean {
+  const text = value.trim();
+  if (!text) {
+    return true;
+  }
+
+  if (text.length < 80) {
+    return false;
+  }
+
+  if (/[.?!:;"')\]]$/.test(text)) {
+    return false;
+  }
+
+  const lastWord = text.split(/\s+/).pop() || '';
+  if (lastWord.length <= 2) {
+    return true;
+  }
+
+  const truncatedEndings = ['do', 'dur', 'ener', 'conti', 'consec', 'obos', 'epuiz', 'incep', 'ince', 'renun'];
+  return truncatedEndings.some((ending) => lastWord.toLowerCase() === ending);
+}
+
 function normalizeStructuredIdeaResult(
   value: unknown,
   fallbackCtaStyle: string
@@ -1137,12 +1328,98 @@ function normalizeStructuredIdeaResult(
   };
 }
 
+type StructuredIdeaBlockKey =
+  | 'mainIdea'
+  | 'hook1'
+  | 'hook2'
+  | 'section1'
+  | 'section2'
+  | 'section3'
+  | 'section4'
+  | 'cta';
+
+function parseStructuredIdeaDelimitedContent(
+  content: string,
+  fallbackCtaStyle: string
+): {
+  parsed: Partial<Record<StructuredIdeaBlockKey, string>>;
+  missing: StructuredIdeaBlockKey[];
+  result: StructuredIdeaResult | null;
+} {
+  const blockMap: Record<StructuredIdeaBlockKey, string> = {
+    mainIdea: 'MAIN_IDEA',
+    hook1: 'HOOK1',
+    hook2: 'HOOK2',
+    section1: 'SECTION1',
+    section2: 'SECTION2',
+    section3: 'SECTION3',
+    section4: 'SECTION4',
+    cta: 'CTA',
+  };
+
+  const parsed = Object.entries(blockMap).reduce((acc, [key, sectionName]) => {
+    const value = extractDelimitedSection(content, sectionName);
+    if (value) {
+      acc[key as StructuredIdeaBlockKey] = value;
+    }
+    return acc;
+  }, {} as Partial<Record<StructuredIdeaBlockKey, string>>);
+
+  const missing = (Object.keys(blockMap) as StructuredIdeaBlockKey[]).filter((key) => !parsed[key]);
+
+  let result: StructuredIdeaResult | null = null;
+  if (missing.length === 0) {
+    const normalized = normalizeStructuredIdeaResult(
+      {
+        mainIdea: parsed.mainIdea,
+        hooks: [parsed.hook1, parsed.hook2],
+        script: [
+          { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[0], text: parsed.section1 },
+          { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[1], text: parsed.section2 },
+          { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[2], text: parsed.section3 },
+          { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[3], text: parsed.section4 },
+        ],
+        cta: parsed.cta,
+        ctaStyleApplied: fallbackCtaStyle,
+        improvements: STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS,
+      },
+      fallbackCtaStyle
+    );
+
+    result = isStructuredIdeaResultIncomplete(normalized) ? null : normalized;
+  }
+
+  return {
+    parsed,
+    missing,
+    result,
+  };
+}
+
+function buildStructuredIdeaDelimitedFormatInstructions(targets: StructuredIdeaBlockKey[]): string {
+  const labels: Record<StructuredIdeaBlockKey, string> = {
+    mainIdea: '===MAIN_IDEA===\n1 propoziție clară, naturală',
+    hook1: '===HOOK1===\nHook scurt și memorabil',
+    hook2: '===HOOK2===\nA doua variantă de hook',
+    section1: '===SECTION1===\nPARTEA 1 – Context, 70-120 cuvinte, text final vorbit',
+    section2: '===SECTION2===\nPARTEA 2 – Explicație clară, 70-120 cuvinte, text final vorbit',
+    section3: '===SECTION3===\nPARTEA 3 – Exemplu / aplicație, 70-120 cuvinte, text final vorbit',
+    section4: '===SECTION4===\nPARTEA 4 – Principiu final, 70-120 cuvinte, text final vorbit',
+    cta: '===CTA===\nCTA final, 30-55 cuvinte',
+  };
+
+  return targets.map((target) => labels[target]).join('\n\n');
+}
+
 function isStructuredIdeaResultIncomplete(result: StructuredIdeaResult): boolean {
   if (!result.mainIdea || looksLikeStructuredIdeaPlaceholder(result.mainIdea)) {
     return true;
   }
 
-  if (result.hooks.length < 2 || result.hooks.some((hook) => looksLikeStructuredIdeaPlaceholder(hook))) {
+  if (
+    result.hooks.length < 2 ||
+    result.hooks.some((hook) => looksLikeStructuredIdeaPlaceholder(hook) || looksLikeWeakStructuredHook(hook))
+  ) {
     return true;
   }
 
@@ -1150,7 +1427,13 @@ function isStructuredIdeaResultIncomplete(result: StructuredIdeaResult): boolean
     result.script.length < STRUCTURED_IDEA_SECTION_TITLES.length ||
     result.script.some((section) => {
       const text = section.text.trim();
-      return !text || looksLikeStructuredIdeaPlaceholder(text) || text.split(/\s+/).length < 40;
+      return (
+        !text ||
+        looksLikeStructuredIdeaPlaceholder(text) ||
+        looksLikeStructuredIdeaMetaText(text) ||
+        looksLikeTruncatedStructuredText(text) ||
+        text.split(/\s+/).length < 40
+      );
     })
   ) {
     return true;
@@ -1159,13 +1442,10 @@ function isStructuredIdeaResultIncomplete(result: StructuredIdeaResult): boolean
   return !result.cta || looksLikeStructuredIdeaPlaceholder(result.cta);
 }
 
-function buildStructuredIdeaPrompt(input: {
-  ideaText: string;
-  niche: string;
-  contentPreferences?: any;
-}): { prompt: string; ctaStyle: string } {
+function buildStructuredIdeaPrompt(input: StructureUserIdeaInput): { prompt: string; ctaStyle: string } {
   const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
   const ctaStyle = input.contentPreferences?.brandVoice?.ctaStyle || 'Mix';
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
 
   const prompt = `Tu ești un expert în content fitness și copywriting conversațional pentru Reels.
 
@@ -1199,6 +1479,12 @@ REGULI OBLIGATORII:
 - Respectă nișa.
 - Nu returna placeholder-e precum "string", titluri simple sau secțiuni goale.
 - Fiecare câmp text trebuie să conțină conținut complet, nu etichete.
+- NU scrie meta-explicații despre content precum: "ideea trebuie", "în partea asta", "mesajul trebuie", "poți spune".
+- Scrie direct textul final, ca și cum antrenorul ar vorbi în cameră.
+- Dacă utilizatorul vorbește din experiență personală, păstrează natural perspectiva de tip "și eu am fost acolo".
+- Hook-urile trebuie să fie scurte, clare și memorabile, nu să repete brut ideea utilizatorului.
+
+${antiRepeatSection}
 
 OUTPUT CERUT:
 1) mainIdea: ideea principală (1 propoziție clară)
@@ -1217,8 +1503,8 @@ OUTPUT CERUT:
    - "Ton adaptat la nișă"
 
 LUNGIME OBLIGATORIE (IMPORTANT):
-- Script total: 500-800 cuvinte.
-- Fiecare secțiune din script: minimum 110-170 cuvinte.
+- Script total: 320-520 cuvinte.
+- Fiecare secțiune din script: minimum 70-120 cuvinte.
 - Fiecare secțiune trebuie să fie completă, fluentă, fără bullets.
 - CTA: minimum 30-55 cuvinte, clar și acționabil.
 
@@ -1226,6 +1512,8 @@ CALITATE OBLIGATORIE:
 - Text conversațional, natural, fără formulări rigide.
 - Fiecare secțiune trebuie să conțină explicație concretă, nu doar afirmații.
 - Menține ideea utilizatorului, dar o dezvoltă clar și coerent.
+- Scriptul trebuie să curgă logic dintr-o secțiune în alta, nu să pară 4 texte separate lipite.
+- Fiecare secțiune trebuie să poată fi citită cu voce tare fără să sune stângaci.
 
 Răspunde DOAR JSON strict.
 IMPORTANT:
@@ -1258,15 +1546,12 @@ FORMAT:
 }
 
 async function generateStructuredIdeaFallback(
-  input: {
-    ideaText: string;
-    niche: string;
-    contentPreferences?: any;
-  },
+  input: StructureUserIdeaInput,
   partialResult: StructuredIdeaResult,
   fallbackCtaStyle: string
 ): Promise<StructuredIdeaResult> {
   const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const sectionsSnapshot = partialResult.script
     .map((section, index) => `${index + 1}. ${section.sectionTitle}: ${section.text || '[LIPSĂ]'}`)
     .join('\n');
@@ -1300,9 +1585,14 @@ TASK:
 - Rescrie răspunsul complet în același format JSON.
 - Păstrează ideea și tonul.
 - Umple toate câmpurile lipsă sau slabe.
-- Fiecare secțiune din script trebuie să aibă 110-170 cuvinte și conținut concret.
+- Fiecare secțiune din script trebuie să aibă 70-120 cuvinte și conținut concret.
 - Nu lăsa texte precum "string", titluri simple sau secțiuni goale.
 - Returnează exact 4 secțiuni de script și exact 4 itemi la improvements.
+- NU descrie cum ar trebui construit mesajul. Scrie direct varianta finală, ca text vorbit.
+- NU folosi formulări meta precum "ideea trebuie", "mesajul trebuie", "în partea asta", "poți spune".
+- Hook-urile trebuie rescrise complet dacă sunt vagi, prea lungi sau repetă brut ideea utilizatorului.
+
+${antiRepeatSection}
 
 Returnează DOAR JSON valid.`;
 
@@ -1315,6 +1605,125 @@ function extractTaggedValue(content: string, tag: string): string {
   const pattern = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i');
   const match = content.match(pattern);
   return match?.[1]?.trim() || '';
+}
+
+type MultiFormatIdeaKey = 'reel' | 'carousel' | 'story';
+
+function extractDelimitedSection(content: string, sectionName: string): string {
+  const pattern = new RegExp(`===${sectionName}===([\\s\\S]*?)(?=\\n===|$)`, 'i');
+  const match = content.match(pattern);
+  return match?.[1]?.trim() || '';
+}
+
+function extractDelimitedLineValue(content: string, label: string): string {
+  const pattern = new RegExp(`^${label}:\\s*(.+)$`, 'im');
+  const match = content.match(pattern);
+  return match?.[1]?.trim() || '';
+}
+
+function parseDelimitedFormatSection(
+  content: string,
+  key: MultiFormatIdeaKey,
+  expectedFormat: DailyIdeaResult['format']
+): DailyIdeaResult | null {
+  const sectionName = key.toUpperCase();
+  const section = extractDelimitedSection(content, sectionName);
+
+  if (!section) {
+    return null;
+  }
+
+  try {
+    return normalizeDailyIdeaResult(
+      {
+        format: expectedFormat,
+        hook: extractDelimitedLineValue(section, 'HOOK'),
+        script: Array.from({ length: 4 }, (_, index) => ({
+          scene: index + 1,
+          text: extractDelimitedLineValue(section, `SCENE${index + 1}`),
+          visual: extractDelimitedLineValue(section, `VISUAL${index + 1}`),
+        })),
+        cta: extractDelimitedLineValue(section, 'CTA'),
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: extractDelimitedLineValue(section, 'LEAD_MAGNET'),
+        dmKeyword: extractDelimitedLineValue(section, 'DM_KEYWORD'),
+        reasoning: extractDelimitedLineValue(section, 'REASONING'),
+      },
+      expectedFormat
+    );
+  } catch {
+    return null;
+  }
+}
+
+function parseDelimitedMultiFormatIdeaContent(content: string): {
+  parsed: Partial<Record<MultiFormatIdeaKey, DailyIdeaResult>>;
+  missing: MultiFormatIdeaKey[];
+} {
+  const parsed: Partial<Record<MultiFormatIdeaKey, DailyIdeaResult>> = {};
+  const formats: Array<{ key: MultiFormatIdeaKey; expectedFormat: DailyIdeaResult['format'] }> = [
+    { key: 'reel', expectedFormat: 'REEL' },
+    { key: 'carousel', expectedFormat: 'CAROUSEL' },
+    { key: 'story', expectedFormat: 'STORY' },
+  ];
+
+  const missing = formats
+    .filter(({ key, expectedFormat }) => {
+      const result = parseDelimitedFormatSection(content, key, expectedFormat);
+      if (result) {
+        parsed[key] = result;
+        return false;
+      }
+      return true;
+    })
+    .map(({ key }) => key);
+
+  return { parsed, missing };
+}
+
+function assembleMultiFormatIdeaResult(
+  parsed: Partial<Record<MultiFormatIdeaKey, DailyIdeaResult>>,
+  source: MultiFormatIdeaResult['source']
+): MultiFormatIdeaResult {
+  if (!parsed.reel || !parsed.carousel || !parsed.story) {
+    throw new Error('Incomplete multi-format parsed result.');
+  }
+
+  return {
+    reel: parsed.reel,
+    carousel: parsed.carousel,
+    story: parsed.story,
+    source,
+  };
+}
+
+function buildDelimitedFormatInstructions(targets: MultiFormatIdeaKey[]): string {
+  const formatMap: Record<MultiFormatIdeaKey, DailyIdeaResult['format']> = {
+    reel: 'REEL',
+    carousel: 'CAROUSEL',
+    story: 'STORY',
+  };
+
+  return targets
+    .map((target) => {
+      const format = formatMap[target];
+      return `===${format}===
+HOOK: hook scurt și specific, pe un singur rând
+SCENE1: text complet, pe un singur rând
+VISUAL1: vizual scurt, filmabil
+SCENE2: text complet, pe un singur rând
+VISUAL2: vizual scurt, filmabil
+SCENE3: text complet, pe un singur rând
+VISUAL3: vizual scurt, filmabil
+SCENE4: concluzie practică, fără CTA, pe un singur rând
+VISUAL4: vizual scurt, filmabil
+CTA: CTA cu keyword DM și beneficiu clar, pe un singur rând
+LEAD_MAGNET: lead magnet scurt, pe un singur rând
+DM_KEYWORD: un singur keyword
+REASONING: 1-2 propoziții scurte, pe un singur rând`;
+    })
+    .join('\n\n');
 }
 
 function normalizeIdeaSeedText(value: string): string {
@@ -1332,38 +1741,301 @@ function buildStructuredIdeaEmergencyHooks(seed: string, niche: string): string[
   ].map((hook) => hook.slice(0, 120).trim());
 }
 
-function buildStructuredIdeaEmergencyResult(input: {
-  ideaText: string;
-  niche: string;
-  contentPreferences?: any;
-}): StructuredIdeaResult {
+function extractIdeaSentences(ideaText: string): string[] {
+  return ideaText
+    .split(/[.!?]+/)
+    .map((sentence) => sentence.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+function buildStructuredIdeaMainPoint(ideaText: string): string {
+  const sentences = extractIdeaSentences(ideaText);
+  const firstSentence = sentences[0] || normalizeIdeaSeedText(ideaText);
+  return firstSentence
+    .replace(/^vreau sa vorbesc despre\s*/i, '')
+    .replace(/^vreau să vorbesc despre\s*/i, '')
+    .replace(/^cum\s+/i, '')
+    .replace(/\s*,\s*/g, ', ')
+    .trim();
+}
+
+function buildStructuredIdeaDirectHooks(ideaText: string): string[] {
+  const mainPoint = buildStructuredIdeaMainPoint(ideaText);
+
+  const hooks = [
+    'Nu e despre talent. E despre să nu te oprești prea repede',
+    'Ce am înțeles când am încetat să mai renunț la primul greu',
+    'Orice scop devine mai ușor când nu-l tratezi ca pe o pedeapsă',
+    'Perseverența nu trebuie să doară ca să te ducă departe',
+  ];
+
+  if (!mainPoint) {
+    return hooks.slice(0, 2);
+  }
+
+  return [
+    hooks[0],
+    hooks[1],
+  ];
+}
+
+function buildStructuredIdeaRescueCta(mainIdea: string, ctaStyle: string): string {
+  const compactIdea = normalizeIdeaSeedText(mainIdea)
+    .replace(/^cum\s+/i, '')
+    .replace(/[.?!]+$/g, '');
+
+  if (/educational|educational \(salveaza \/ share\)|educațional/i.test(ctaStyle)) {
+    return `Dacă ți-a pus ordine în minte ideea asta despre ${compactIdea || 'perseverență și consecvență'}, salvează materialul și trimite-l cuiva care are nevoie să audă asta exact acum.`;
+  }
+
+  if (/dm|lead/i.test(ctaStyle)) {
+    return `Dacă vrei, îți transform și alte idei brute în scripturi clare, naturale și ușor de spus pe cameră. Scrie-mi în privat și le lucrăm împreună.`;
+  }
+
+  return `Dacă vrei, îți transform și alte idei brute în scripturi clare, naturale și ușor de spus pe cameră, ca să nu mai sune nici rigide, nici trase de păr.`;
+}
+
+function buildStructuredIdeaRescueSection4(mainIdea: string, section3: string): string {
+  const compactIdea = normalizeIdeaSeedText(mainIdea)
+    .replace(/[.?!]+$/g, '')
+    .trim();
+  const fallbackLead = compactIdea
+    ? `Ideea de ținut minte e asta: ${compactIdea.charAt(0).toLowerCase()}${compactIdea.slice(1)}.`
+    : 'Ideea de ținut minte e asta: nu trebuie să transformi tot procesul într-o luptă continuă ca să ajungi unde vrei.';
+
+  const section3Hint = normalizeIdeaSeedText(section3).toLowerCase();
+  const hasBurnoutSignal =
+    section3Hint.includes('burnout') ||
+    section3Hint.includes('epuiz') ||
+    section3Hint.includes('obos') ||
+    section3Hint.includes('energie');
+
+  if (hasBurnoutSignal) {
+    return `${fallbackLead} Nu trebuie să te rupi în două ca să demonstrezi că meriți rezultatul. Ai nevoie să rămâi suficient de consecvent, suficient de serios și suficient de prezent încât munca ta să se adune în timp. Acolo apare progresul real. Nu când forțezi două zile și apoi cazi, ci când continui într-un ritm pe care chiar îl poți duce. Când înțelegi asta, succesul nu mai arată ca o pedeapsă, ci ca un drum pe care poți merge fără să te pierzi pe tine pe parcurs.`;
+  }
+
+  return `${fallbackLead} Cei care ajung unde își propun nu sunt mereu cei mai talentați, ci cei care nu se opresc de fiecare dată când apare primul greu. Perseverența bună nu înseamnă încăpățânare oarbă, ci capacitatea de a continua și de a-ți păstra direcția chiar și când ritmul nu e perfect. Exact acolo se construiește diferența dintre intenție și rezultat. Dacă rămâi în joc suficient de mult, munca începe să se vadă.`;
+}
+
+function buildStructuredIdeaRescueSection2(mainIdea: string, section1: string): string {
+  const compactIdea = normalizeIdeaSeedText(mainIdea).replace(/[.?!]+$/g, '').trim();
+  const section1Hint = normalizeIdeaSeedText(section1).toLowerCase();
+  const hasEnergySignal =
+    section1Hint.includes('energie') ||
+    section1Hint.includes('obosit') ||
+    section1Hint.includes('epuiz') ||
+    section1Hint.includes('durer');
+
+  if (hasEnergySignal) {
+    return `Adevărul este că nu trebuie să alegi între rezultate și starea ta de bine. ${compactIdea ? compactIdea.charAt(0).toUpperCase() + compactIdea.slice(1) : 'Poți să ajungi unde îți propui'} dacă înțelegi că seriozitatea nu înseamnă să tragi de tine până te storci. Înseamnă să fii consecvent și să revii la planul tău chiar și în zilele mai slabe. Munca făcută inteligent bate efortul dus în extreme. Când nu mai vezi progresul ca pe o pedeapsă, începi să-l poți susține cu mai mult calm, mai multă claritate și mai puțină presiune pe tine.`;
+  }
+
+  return `Explicația simplă este asta: rezultatele nu apar pentru că te forțezi haotic o perioadă scurtă, ci pentru că rămâi suficient de constant cât să lași efortul să se adune. ${compactIdea ? compactIdea.charAt(0).toUpperCase() + compactIdea.slice(1) : 'Scopurile mari'} devin mai ușor de dus când le spargi în pași repetabili și când nu te sperii de primele zile grele. Asta înseamnă perseverență reală. Nu dramă, nu epuizare, ci seriozitatea de a continua și atunci când nu totul merge perfect.`;
+}
+
+function buildStructuredIdeaRescueSection3(mainIdea: string, section2: string): string {
+  const section2Hint = normalizeIdeaSeedText(section2).toLowerCase();
+  const hasConsistencySignal =
+    section2Hint.includes('constant') ||
+    section2Hint.includes('consecvent') ||
+    section2Hint.includes('ritm') ||
+    section2Hint.includes('contin');
+
+  if (hasConsistencySignal) {
+    return `Uite cum se vede asta în viața reală: pornești cu entuziasm, te ții câteva zile, apoi vine o zi aglomerată și simți imediat că parcă tot planul s-a rupt. Exact acolo apare capcana. În loc să adaptezi ritmul și să mergi mai departe, ai tendința să crezi că totul a eșuat și că trebuie să reîncepi perfect de luni. Dar nu asta te ajută. Te ajută să continui într-o variantă mai simplă, dar să continui. Acolo se construiește încrederea că poți ajunge unde vrei fără să te consumi inutil pe drum.`;
+  }
+
+  return `Imaginează-ți o perioadă în care îți propui ceva mare și după primele obstacole începi să simți că e prea mult. Asta pățesc cei mai mulți. Nu pentru că nu pot, ci pentru că interpretează orice zi mai grea ca pe un semn că drumul e greșit. În realitate, progresul apare când accepți că uneori mergi mai tare, alteori mai încet, dar nu abandonezi ideea de bază. Când înveți să continui fără să dramatizezi fiecare pas, tot procesul devine mai stabil și mai ușor de dus.`;
+}
+
+function buildStructuredIdeaRescueSection1(mainIdea: string): string {
+  const compactIdea = normalizeIdeaSeedText(mainIdea).replace(/[.?!]+$/g, '').trim();
+  return `Știu cum e să te uiți la un scop mare și să simți din prima că o să te coste prea multă energie. Și eu am trecut prin faza în care aveam impresia că, dacă vreau un rezultat serios, trebuie automat să trag de mine până mă storc. Doar că fix ideea asta m-a blocat cel mai tare. ${compactIdea ? compactIdea.charAt(0).toUpperCase() + compactIdea.slice(1) : 'Schimbarea reală'} începe abia când încetezi să mai vezi procesul ca pe o pedeapsă și începi să-l construiești într-un mod pe care chiar îl poți duce în viața reală.`;
+}
+
+function rescueStructuredIdeaResultFromPartial(
+  parsed: Partial<Record<StructuredIdeaBlockKey, string>>,
+  fallbackCtaStyle: string
+): StructuredIdeaResult | null {
+  const requiredCore: StructuredIdeaBlockKey[] = [
+    'mainIdea',
+    'hook1',
+    'hook2',
+    'section1',
+  ];
+
+  if (requiredCore.some((key) => !parsed[key])) {
+    return null;
+  }
+
+  const repairedSection1 =
+    parsed.section1 && !looksLikeTruncatedStructuredText(parsed.section1) && !looksLikeStructuredIdeaMetaText(parsed.section1)
+      ? parsed.section1
+      : buildStructuredIdeaRescueSection1(parsed.mainIdea || '');
+
+  const repairedSection2 =
+    parsed.section2 &&
+    parsed.section2.trim().split(/\s+/).length >= 28 &&
+    !looksLikeStructuredIdeaMetaText(parsed.section2) &&
+    !looksLikeTruncatedStructuredText(parsed.section2)
+      ? parsed.section2
+      : buildStructuredIdeaRescueSection2(parsed.mainIdea || '', repairedSection1);
+  const rescuedSection4 =
+    parsed.section4 && !looksLikeTruncatedStructuredText(parsed.section4)
+      ? parsed.section4
+      : buildStructuredIdeaRescueSection4(parsed.mainIdea || '', parsed.section3 || repairedSection2);
+  const repairedSection3 =
+    parsed.section3 &&
+    parsed.section3.trim().split(/\s+/).length >= 28 &&
+    !looksLikeStructuredIdeaMetaText(parsed.section3) &&
+    !looksLikeTruncatedStructuredText(parsed.section3)
+      ? parsed.section3
+      : buildStructuredIdeaRescueSection3(parsed.mainIdea || '', repairedSection2);
+  const repairedHooks = [parsed.hook1, parsed.hook2].map((hook, index) => {
+    if (hook && !looksLikeWeakStructuredHook(hook) && !looksLikeStructuredIdeaPlaceholder(hook)) {
+      return hook;
+    }
+
+    return buildStructuredIdeaDirectHooks(parsed.mainIdea || parsed.section1 || '')[index] || '';
+  });
+
+  const rescued = normalizeStructuredIdeaResult(
+    {
+      mainIdea: parsed.mainIdea,
+      hooks: repairedHooks,
+      script: [
+        { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[0], text: repairedSection1 },
+        { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[1], text: repairedSection2 },
+        { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[2], text: repairedSection3 },
+        { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[3], text: rescuedSection4 },
+      ],
+      cta: parsed.cta || buildStructuredIdeaRescueCta(parsed.mainIdea || '', fallbackCtaStyle),
+      ctaStyleApplied: fallbackCtaStyle,
+      improvements: STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS,
+    },
+    fallbackCtaStyle
+  );
+
+  return {
+    ...rescued,
+    hooks: repairedHooks,
+    script: [
+      { ...rescued.script[0], text: repairedSection1 },
+      { ...rescued.script[1], text: repairedSection2 },
+      { ...rescued.script[2], text: repairedSection3 },
+      { ...rescued.script[3], text: rescuedSection4 },
+    ],
+    cta: rescued.cta || buildStructuredIdeaRescueCta(parsed.mainIdea || '', fallbackCtaStyle),
+  };
+}
+
+function acceptStructuredIdeaResultFromFullAiBlocks(
+  parsed: Partial<Record<StructuredIdeaBlockKey, string>>,
+  fallbackCtaStyle: string
+): StructuredIdeaResult | null {
+  const allBlocks: StructuredIdeaBlockKey[] = [
+    'mainIdea',
+    'hook1',
+    'hook2',
+    'section1',
+    'section2',
+    'section3',
+    'section4',
+    'cta',
+  ];
+
+  if (allBlocks.some((key) => !parsed[key])) {
+    return null;
+  }
+
+  const normalized = normalizeStructuredIdeaResult(
+    {
+      mainIdea: parsed.mainIdea,
+      hooks: [parsed.hook1, parsed.hook2],
+      script: [
+        { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[0], text: parsed.section1 },
+        { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[1], text: parsed.section2 },
+        { sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[2], text: parsed.section3 },
+        {
+          sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[3],
+          text: parsed.section4 || buildStructuredIdeaRescueSection4(parsed.mainIdea || '', parsed.section3 || ''),
+        },
+      ],
+      cta: parsed.cta || buildStructuredIdeaRescueCta(parsed.mainIdea || '', fallbackCtaStyle),
+      ctaStyleApplied: fallbackCtaStyle,
+      improvements: STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS,
+    },
+    fallbackCtaStyle
+  );
+
+  const repaired: StructuredIdeaResult = {
+    ...normalized,
+    hooks: normalized.hooks.map((hook, index) => {
+      if (!looksLikeWeakStructuredHook(hook) && !looksLikeStructuredIdeaPlaceholder(hook)) {
+        return hook;
+      }
+
+      return buildStructuredIdeaDirectHooks(parsed.mainIdea || parsed.section1 || '')[index] || hook;
+    }),
+    script: normalized.script.map((section, index) => {
+      if (!looksLikeStructuredIdeaMetaText(section.text) && section.text.trim().split(/\s+/).length >= 40) {
+        return section;
+      }
+
+      if (index === 3) {
+        return {
+          ...section,
+          text: buildStructuredIdeaRescueSection4(parsed.mainIdea || '', parsed.section3 || ''),
+        };
+      }
+
+      return section;
+    }),
+    cta:
+      normalized.cta && !looksLikeStructuredIdeaPlaceholder(normalized.cta)
+        ? normalized.cta
+        : buildStructuredIdeaRescueCta(parsed.mainIdea || '', fallbackCtaStyle),
+  };
+
+  return repaired;
+}
+
+function buildStructuredIdeaEmergencyResult(input: StructureUserIdeaInput): StructuredIdeaResult {
   const ideaSeed = normalizeIdeaSeedText(input.ideaText);
   const nicheSeed = normalizeIdeaSeedText(input.niche);
   const ctaStyle = input.contentPreferences?.brandVoice?.ctaStyle || 'Mix';
-  const hooks = buildStructuredIdeaEmergencyHooks(ideaSeed, nicheSeed);
+  const sentences = extractIdeaSentences(input.ideaText);
+  const coreIdea = buildStructuredIdeaMainPoint(input.ideaText);
+  const personalShift =
+    sentences.find((sentence) => /candva|cândva|si eu|și eu|am fost/i.test(sentence)) ||
+    'Și eu am fost în punctul în care vedeam disciplina ca pe ceva greu și obositor.';
+  const closingThought =
+    sentences.find((sentence) => /nu te lasa|nu te lăsa|munceste|muncește|continua|continuă/i.test(sentence)) ||
+    'Nu te lăsa exact în momentul în care încă nu vezi rezultatul, pentru că acolo renunță cei mai mulți.';
+  const hooks = buildStructuredIdeaDirectHooks(input.ideaText);
 
   return {
-    mainIdea: ideaSeed,
+    mainIdea: coreIdea || ideaSeed,
     hooks,
     script: [
       {
         sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[0],
-        text: `Mulți oameni din nișa ${nicheSeed} pornesc exact din punctul descris de tine: ${ideaSeed}. Problema este că ideea rămâne, de multe ori, la nivel de observație generală și nu ajunge să fie înțeleasă clar de omul care te urmărește. În partea de context trebuie să numești situația concretă, frustrarea pe care o simte persoana și motivul pentru care subiectul apare atât de des în viața ei. Așa creezi atenție și faci publicul să simtă imediat că vorbești despre realitatea lui, nu despre un sfat generic.`,
+        text: `${personalShift} Mult timp am crezut că, dacă un lucru cere perseverență, înseamnă automat că trebuie să doară, să te stoarcă și să te facă să simți că tragi de tine în fiecare zi. Doar că nu acolo era problema. Problema era felul în care mă uitam la muncă și la disciplină: ca la o povară, nu ca la ceva care se construiește pas cu pas. Și cred că foarte mulți oameni se blochează exact aici. Vor un rezultat mare, dar în mintea lor drumul până acolo arată atât de greu încât obosesc înainte să înceapă serios.`,
       },
       {
         sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[1],
-        text: `După context, mesajul trebuie explicat simplu și logic. Pleci de la ideea ta, ${ideaSeed}, și arăți ce se întâmplă în practică, pas cu pas. Important este să explici de ce apare comportamentul respectiv, ce greșeală se repetă și ce ar trebui înțeles diferit. Fără jargon și fără propoziții vagi, partea aceasta trebuie să traducă ideea într-un limbaj clar, conversațional și util. Când omul înțelege mecanismul, nu mai percepe conținutul doar ca pe o părere, ci ca pe o explicație care îl ajută să acționeze mai bine.`,
+        text: `Adevărul este că poți atinge aproape orice scop dacă rămâi suficient de mult în joc, dar fără să transformi tot procesul într-o luptă continuă cu tine. Perseverența nu înseamnă să mergi zilnic la maximum. Înseamnă să continui și când nu ai chef, și când nu vezi imediat rezultatul, și când progresul nu arată spectaculos. Seriozitatea nu înseamnă rigiditate. Înseamnă să-ți iei promisiunea în serios chiar și în zilele obișnuite. Iar munca nu trebuie să pară o pedeapsă. Când o vezi ca pe o serie de pași repetabili, începe să pară mai ușor de dus și mai realist de ținut.`,
       },
       {
         sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[2],
-        text: `Ca să devină memorabil, mesajul are nevoie de un exemplu ușor de recunoscut. Poți lua o situație frecventă din nișa ${nicheSeed} și să arăți cum arată problema într-o zi normală: ce face omul, unde se blochează și de ce renunță sau repetă aceeași greșeală. Apoi legi exemplul direct de ideea ta și îi arăți ce ar schimba concret. Partea aceasta face trecerea de la teorie la aplicare și îl ajută pe urmăritor să se vadă în poveste, ceea ce crește mult claritatea și relevanța mesajului.`,
+        text: `Uite cum se vede asta în viața reală: începi ceva cu entuziasm, te ții câteva zile, apoi vine o zi mai aglomerată, o stare mai proastă sau o perioadă în care nu mai simți că merge. Și exact atunci apare gândul că poate nu e pentru tine sau că e prea greu. Dar de multe ori nu ai nevoie să schimbi scopul. Ai nevoie doar să nu abandonezi la primul blocaj. Să reduci ritmul, să simplifici pasul următor, să continui într-o formă mai ușoară, dar să continui. Acolo se face diferența între oamenii care doar pornesc și cei care chiar ajung undeva.`,
       },
       {
         sectionTitle: STRUCTURED_IDEA_SECTION_TITLES[3],
-        text: `La final, ideea trebuie închisă într-un principiu simplu și puternic. Nu repeți ce ai spus, ci formulezi concluzia într-un mod care rămâne în mintea omului: schimbarea nu vine din perfecțiune, ci din înțelegere și aplicare consecventă. Raportat la ${ideaSeed}, principiul final trebuie să transmită că progresul apare când simplifici mesajul, îl conectezi la realitatea omului și oferi o direcție clară. Asta lasă publicul cu senzația că a primit ceva util, coerent și imediat aplicabil, nu doar un text bine formulat.`,
+        text: `Asta e ideea pe care vreau s-o ții minte: nu trebuie să faci totul greu ca să ajungi departe. Trebuie doar să fii suficient de serios încât să nu renunți de fiecare dată când devine incomod. ${closingThought} Rezultatele mari nu apar pentru că ai avut motivație perfectă, ci pentru că ai rămas acolo destul de mult cât să lași munca să se adune. Când înțelegi asta, disciplina nu mai pare o pedeapsă. Pare exact ce este: un drum pe care mergi mai departe, chiar și atunci când încă nu se vede tot.`,
       },
     ],
-    cta: `Dacă vrei, îți transform ideea într-un script complet, clar și adaptat pentru nișa ta. Trimite-mi un mesaj și plecăm exact de la subiectul acesta, ca să-l facem mai ușor de înțeles și mai ușor de pus în practică.`,
+    cta: `Dacă vrei, îți transform și alte idei brute în scripturi clare, naturale și ușor de spus pe cameră, ca să nu mai sune nici rigide, nici trase de păr.`,
     ctaStyleApplied: ctaStyle,
     improvements: [...STRUCTURED_IDEA_DEFAULT_IMPROVEMENTS],
   };
@@ -1400,67 +2072,272 @@ function buildEmergencyScenes(lines: string[], visualPrefix: string): Scene[] {
   }));
 }
 
+function selectEmergencyVariantIndex(seed: string, count: number): number {
+  const normalized = normalizeIdeaSeedText(seed);
+  let hash = 0;
+
+  for (let index = 0; index < normalized.length; index += 1) {
+    hash = (hash * 31 + normalized.charCodeAt(index)) >>> 0;
+  }
+
+  const tick = Number(process.hrtime.bigint() % BigInt(count));
+  return (hash + tick) % count;
+}
+
 function buildMultiFormatIdeaEmergencyResult(input: DailyIdeaInput): MultiFormatIdeaResult {
   const audienceLabel = buildEmergencyAudienceLabel(input.niche);
   const baseLeadMagnet = buildEmergencyLeadMagnet(audienceLabel);
+  const variantIndex = selectEmergencyVariantIndex(
+    `${input.niche}|${input.general ? 'general' : 'niche'}`,
+    4
+  );
+
+  if (variantIndex === 0) {
+    return {
+      reel: {
+        format: 'REEL',
+        hook: buildEmergencyHook('3 greșeli care îți scad energia fără să-ți dai seama'),
+        script: buildEmergencyScenes(
+          [
+            `Dacă te trezești obosit și simți disconfort încă de dimineață, problema nu e doar lipsa de chef. Pentru mulți ${audienceLabel}, ziua începe deja cu tensiune în corp, stat mult cocoșat și prea puțină mișcare reală.`,
+            `Prima greșeală este să sari direct în ritmul zilei fără două minute de activare. Câteva mișcări simple pentru gât, umeri și șolduri schimbă felul în care pornește corpul și reduc senzația că ești deja blocat înainte să începi.`,
+            `A doua greșeală este să stai mult în aceeași poziție și să confunzi oboseala cu lipsa de motivație. De multe ori, corpul îți cere o pauză scurtă și circulație mai bună, nu încă o oră de stat strâns în aceeași postură.`,
+            `A treia greșeală este să crezi că ai nevoie de un plan complicat. Ai nevoie de o rutină simplă, repetabilă și clară. Dacă vrei varianta mea scurtă, scrie ENERGIE în DM și îți trimit pașii de bază.`,
+          ],
+          'Cadru REEL'
+        ),
+        cta: 'Scrie ENERGIE în DM și îți trimit rutina simplă pentru mai multă energie și mai puțin disconfort.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'ENERGIE',
+        reasoning: `Acest Reel funcționează pentru că pornește dintr-o problemă foarte recognoscibilă pentru ${audienceLabel}: oboseală, rigiditate și disconfort în rutina zilnică. Structura pe greșeli creează claritate și retenție, iar soluțiile sunt suficient de simple încât să pară imediat aplicabile. CTA-ul leagă direct problema de un pas concret, fără să ceară efort mare din partea utilizatorului.`,
+      },
+      carousel: {
+        format: 'CAROUSEL',
+        hook: buildEmergencyHook('Ce să schimbi azi ca să nu mai tragi de tine'),
+        script: buildEmergencyScenes(
+          [
+            `Slide-ul acesta deschide problema clar: dacă ai puțină energie și corpul îți dă semnale de disconfort, nu înseamnă că trebuie să te forțezi mai tare. Pentru mulți ${audienceLabel}, de multe ori lipsește structura de bază, nu voința.`,
+            `Primul lucru pe care merită să-l schimbi este începutul zilei. Un start mai calm, cu puțină mobilitate și o trecere mai bună către efort, îți poate schimba complet nivelul de energie din următoarele ore.`,
+            `Al doilea punct este felul în care îți împarți mișcarea peste zi. Dacă stai mult și apoi încerci să recuperezi totul dintr-odată, corpul intră ușor în tensiune și oboseala se simte și mai tare.`,
+            `Al treilea lucru este să reduci așteptarea că ai nevoie de perfecțiune. Pentru publicul acesta, progresul vine mai repede din pași simpli și constanți decât din perioade scurte în care tragi foarte tare și apoi cazi complet.`,
+          ],
+          'Slide CAROUSEL'
+        ),
+        cta: 'Scrie ECHILIBRU în DM și îți trimit schema simplă cu pașii de bază.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'ECHILIBRU',
+        reasoning: `Carousel-ul funcționează pentru că organizează informația într-o formă ușor de parcurs și de salvat. Publicul vede clar unde greșește și ce poate ajusta fără să simtă că primește o soluție complicată. Hook-ul promite claritate, iar CTA-ul cere un gest mic, cu beneficiu imediat și relevant.`,
+      },
+      story: {
+        format: 'STORY',
+        hook: buildEmergencyHook('Dacă te doare tot și n-ai energie, oprește-te un minut'),
+        script: buildEmergencyScenes(
+          [
+            `Dacă simți că te trezești deja fără energie, nu e ceva ce trebuie ignorat. La mulți ${audienceLabel}, combinația dintre stres, stat mult și lipsa unei rutine simple se simte direct în corp.`,
+            `Nu începe cu planuri mari. Începe cu puțină mobilitate, mai multă atenție la postură și câteva pauze scurte care să te scoată din rigiditate.`,
+            `Când faci asta constant, nu doar că scade disconfortul, dar începi să simți că ai mai mult control peste zi. Asta îți crește și energia, și încrederea că poți rămâne consecvent.`,
+            `Dacă vrei varianta mea scurtă și clară, scrie START în DM și ți-o trimit imediat.`,
+          ],
+          'Cadru STORY'
+        ),
+        cta: 'Scrie START în DM și îți trimit pașii simpli pentru o zi cu mai puțin disconfort.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'START',
+        reasoning: `Story-ul merge bine pentru că mesajul este direct, ușor de consumat și are urgență naturală. Problema este formulată simplu, fără jargon, iar soluția pare realistă pentru cineva cu program încărcat. CTA-ul este scurt și foarte ușor de executat.`,
+      },
+      source: 'emergency-fallback',
+    };
+  }
+
+  if (variantIndex === 1) {
+    return {
+      reel: {
+        format: 'REEL',
+        hook: buildEmergencyHook('Nu ai nevoie de extreme ca să vezi corpul mai ferm'),
+        script: buildEmergencyScenes(
+          [
+            `Mulți ${audienceLabel} cred că rezultatele apar doar când faci totul perfect: sală multă, dietă strictă și disciplină fără pauză. Adevărul este că tocmai presiunea asta îi face pe mulți să renunțe repede.`,
+            `Primul pas este să cobori standardul de intrare, nu obiectivul. Dacă poți face două sau trei sesiuni scurte pe săptămână, ai deja baza pe care poți construi fără să-ți dai viața peste cap.`,
+            `Al doilea pas este să repeți aceleași mișcări utile suficient de des încât corpul să se adapteze. Consecvența bate varietatea haotică atunci când vrei tonifiere și mai mult control asupra corpului tău.`,
+            `Dacă vrei structura simplă pe care o folosesc pentru consistență fără extreme, scrie RUTINA în DM și ți-o trimit imediat.`,
+          ],
+          'Cadru REEL'
+        ),
+        cta: 'Scrie RUTINA în DM și îți trimit schema simplă pentru consistență fără extreme.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'RUTINA',
+        reasoning: `Acest Reel funcționează pentru că sparge o credință foarte comună la ${audienceLabel}: ideea că progresul cere extreme. Mesajul reduce rezistența, face obiectivul să pară realizabil și mută atenția pe consecvență. CTA-ul promite un cadru simplu și concret.`,
+      },
+      carousel: {
+        format: 'CAROUSEL',
+        hook: buildEmergencyHook('Cum arată, de fapt, progresul sustenabil'),
+        script: buildEmergencyScenes(
+          [
+            `Primul slide clarifică problema: mulți caută rezultate rapide și ajung să alterneze perioade foarte bune cu perioade în care nu mai fac nimic. Pentru ${audienceLabel}, ciclul acesta consumă energie și scade încrederea.`,
+            `Al doilea slide explică regula de bază: antrenamente puține, dar repetate, sunt mai valoroase decât planuri perfecte pe care nu le poți susține în ritmul tău real.`,
+            `Al treilea slide arată ce urmărești concret: mai multă forță de bază, postură mai bună, mai mult control și semne mici că rutina se lipește de viața ta, nu că lucrezi împotriva ei.`,
+            `Ultimul slide mută focusul dinspre perfecțiune spre structură. Când ai reguli simple și realist de aplicat, corpul răspunde mai bine decât atunci când îl duci dintr-o extremă în alta.`,
+          ],
+          'Slide CAROUSEL'
+        ),
+        cta: 'Scrie CONSECVENT în DM și îți trimit pașii de bază pentru progres sustenabil.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'CONSECVENT',
+        reasoning: `Carousel-ul funcționează pentru că traduce ideea abstractă de progres sustenabil în criterii clare și ușor de reținut. Fiecare slide reduce confuzia și îl face pe cititor să-și reevalueze așteptările. CTA-ul continuă natural conversația.`,
+      },
+      story: {
+        format: 'STORY',
+        hook: buildEmergencyHook('Dacă tot începi și te oprești, problema nu e voința'),
+        script: buildEmergencyScenes(
+          [
+            `Dacă simți că mereu începi bine și apoi pierzi ritmul, nu înseamnă că nu ești disciplinat. Pentru mulți ${audienceLabel}, planul este pur și simplu prea greu de susținut.`,
+            `Un plan bun nu te stoarce în primele zile. Îți lasă spațiu să-l repeți și într-o săptămână aglomerată, nu doar într-una ideală.`,
+            `Când simplifici suficient, începi să strângi dovezi că poți rămâne consecvent. Asta schimbă și corpul, și felul în care te raportezi la proces.`,
+            `Dacă vrei varianta mea scurtă pentru săptămâni aglomerate, scrie PLAN în DM.`,
+          ],
+          'Cadru STORY'
+        ),
+        cta: 'Scrie PLAN în DM și îți trimit structura simplă pentru săptămâni aglomerate.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'PLAN',
+        reasoning: `Story-ul merge bine pentru că pornește dintr-o frustrare foarte comună și o reframează fără judecată. Soluția pare realistă și ușor de testat, iar CTA-ul este scurt și potrivit pentru contextul de Story.`,
+      },
+      source: 'emergency-fallback',
+    };
+  }
+
+  if (variantIndex === 2) {
+    return {
+      reel: {
+        format: 'REEL',
+        hook: buildEmergencyHook('Dacă te dor spatele și umerii, nu ignora semnalul'),
+        script: buildEmergencyScenes(
+          [
+            `Pentru mulți ${audienceLabel}, durerile ușoare de spate și umeri au devenit ceva normal. Dar faptul că te-ai obișnuit cu ele nu înseamnă că trebuie să le accepți ca parte din fiecare zi.`,
+            `Primul lucru util este să observi când corpul stă prea mult în aceeași poziție. De multe ori, problema nu este lipsa unui antrenament dur, ci lipsa mișcării mici și repetate peste zi.`,
+            `Al doilea lucru este să introduci mișcări simple pentru coloană, omoplați și șolduri. Nu rezolvă totul instant, dar schimbă cum se simte corpul când le faci constant și fără grabă.`,
+            `Dacă vrei mini-rutina mea pentru mobilitate și reset, scrie MOBILITATE în DM și ți-o trimit.`,
+          ],
+          'Cadru REEL'
+        ),
+        cta: 'Scrie MOBILITATE în DM și îți trimit mini-rutina simplă pentru mobilitate și reset.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'MOBILITATE',
+        reasoning: `Acest Reel funcționează pentru că atinge un disconfort foarte ușor de recunoscut la ${audienceLabel}. Mesajul nu dramatizează, ci oferă o cale simplă și realistă. CTA-ul promite o soluție practică și imediat utilă.`,
+      },
+      carousel: {
+        format: 'CAROUSEL',
+        hook: buildEmergencyHook('3 semne că corpul tău cere mai multă mobilitate'),
+        script: buildEmergencyScenes(
+          [
+            `Primul semn este rigiditatea de dimineață sau după perioade lungi de stat. Dacă ai nevoie de mult timp până simți că te miști firesc, corpul îți spune deja că are nevoie de mai multă variație.`,
+            `Al doilea semn este că orice antrenament pare mai greu decât ar trebui. Uneori nu lipsa de motivație e problema, ci faptul că intri în efort cu un corp deja tensionat și limitat.`,
+            `Al treilea semn este că te sprijini mereu pe aceleași zone: umeri, gât, lombar. Când segmentele astea preiau totul, apare și senzația că ești mereu obosit sau înțepenit.`,
+            `Concluzia este simplă: mobilitatea nu e un bonus pentru perfecționiști. Este o bază minimă care îți face și antrenamentul, și ziua obișnuită mult mai ușor de dus.`,
+          ],
+          'Slide CAROUSEL'
+        ),
+        cta: 'Scrie POSTURA în DM și îți trimit pașii simpli pentru un corp mai puțin rigid.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'POSTURA',
+        reasoning: `Carousel-ul funcționează pentru că listează semne clare, ușor de auto-identificat. Cititorul poate decide rapid dacă se regăsește, iar asta crește șansa să salveze sau să intre în DM pentru soluție.`,
+      },
+      story: {
+        format: 'STORY',
+        hook: buildEmergencyHook('Te simți mereu înțepenit? Începe de aici'),
+        script: buildEmergencyScenes(
+          [
+            `Dacă te simți mereu înțepenit, nu înseamnă că trebuie să sari direct la antrenamente grele. Pentru mulți ${audienceLabel}, corpul cere mai întâi puțin spațiu și control.`,
+            `Două-trei minute de mobilitate bine alese pot schimba mult felul în care te miști și cum se simte restul zilei.`,
+            `Important este să faci puțin, dar des. Așa scazi tensiunea și începi să simți că ai din nou acces la mișcare, nu că te lupți cu ea.`,
+            `Dacă vrei varianta mea scurtă, scrie RESET în DM.`,
+          ],
+          'Cadru STORY'
+        ),
+        cta: 'Scrie RESET în DM și îți trimit pașii simpli pentru mai puțină rigiditate.',
+        objective: 'Generare lead-uri',
+        conversionRate: 0,
+        leadMagnet: baseLeadMagnet,
+        dmKeyword: 'RESET',
+        reasoning: `Story-ul merge bine pentru că este foarte direct și pornește dintr-o senzație comună: rigiditatea. Soluția este mică și ușor de încercat, ceea ce face CTA-ul natural și ușor de urmat.`,
+      },
+      source: 'emergency-fallback',
+    };
+  }
 
   return {
     reel: {
       format: 'REEL',
-      hook: buildEmergencyHook('3 greșeli care îți scad energia fără să-ți dai seama'),
+      hook: buildEmergencyHook('N-ai nevoie de o oră liberă ca să te miști mai bine'),
       script: buildEmergencyScenes(
         [
-          `Dacă te trezești obosit și simți disconfort încă de dimineață, problema nu e doar lipsa de chef. Pentru mulți ${audienceLabel}, ziua începe deja cu tensiune în corp, stat mult cocoșat și prea puțină mișcare reală.`,
-          `Prima greșeală este să sari direct în ritmul zilei fără două minute de activare. Câteva mișcări simple pentru gât, umeri și șolduri schimbă felul în care pornește corpul și reduc senzația că ești deja blocat înainte să începi.`,
-          `A doua greșeală este să stai mult în aceeași poziție și să confunzi oboseala cu lipsa de motivație. De multe ori, corpul îți cere o pauză scurtă și circulație mai bună, nu încă o oră de stat strâns în aceeași postură.`,
-          `A treia greșeală este să crezi că ai nevoie de un plan complicat. Ai nevoie de o rutină simplă, repetabilă și clară. Dacă vrei varianta mea scurtă, scrie ENERGIE în DM și îți trimit pașii de bază.`,
+          `Mulți ${audienceLabel} renunță la idee înainte să înceapă pentru că își spun că nu au timp. Dar de cele mai multe ori, blocajul nu e lipsa unei ore libere, ci faptul că totul pare prea mare și prea greu de pornit.`,
+          `Dacă poți găsi 10-15 minute clare, poți construi deja o rutină utilă. Cheia nu este durata perfectă, ci să știi exact ce faci în puținul timp pe care îl ai.`,
+          `Când sesiunile sunt scurte și previzibile, le repeți mai ușor. Asta înseamnă mai puține pauze lungi, mai puțină vinovăție și mai multe șanse să vezi schimbări reale în timp.`,
+          `Dacă vrei structura mea pentru antrenamente scurte și utile, scrie 15MIN în DM și ți-o trimit.`,
         ],
         'Cadru REEL'
       ),
-      cta: 'Scrie ENERGIE în DM și îți trimit rutina simplă pentru mai multă energie și mai puțin disconfort.',
+      cta: 'Scrie 15MIN în DM și îți trimit structura simplă pentru antrenamente scurte și utile.',
       objective: 'Generare lead-uri',
       conversionRate: 0,
       leadMagnet: baseLeadMagnet,
-      dmKeyword: 'ENERGIE',
-      reasoning: `Acest Reel funcționează pentru că pornește dintr-o problemă foarte recognoscibilă pentru ${audienceLabel}: oboseală, rigiditate și disconfort în rutina zilnică. Structura pe greșeli creează claritate și retenție, iar soluțiile sunt suficient de simple încât să pară imediat aplicabile. CTA-ul leagă direct problema de un pas concret, fără să ceară efort mare din partea utilizatorului.`,
+      dmKeyword: '15MIN',
+      reasoning: `Acest Reel funcționează pentru că atacă una dintre cele mai mari obiecții ale ${audienceLabel}: lipsa timpului. În loc să împingă un plan greu, promite claritate și o intrare ușoară în acțiune.`,
     },
     carousel: {
       format: 'CAROUSEL',
-      hook: buildEmergencyHook('Ce să schimbi azi ca să nu mai tragi de tine'),
+      hook: buildEmergencyHook('Cum folosești 15 minute fără să le irosești'),
       script: buildEmergencyScenes(
         [
-          `Slide-ul acesta deschide problema clar: dacă ai puțină energie și corpul îți dă semnale de disconfort, nu înseamnă că trebuie să te forțezi mai tare. Pentru mulți ${audienceLabel}, de multe ori lipsește structura de bază, nu voința.`,
-          `Primul lucru pe care merită să-l schimbi este începutul zilei. Un start mai calm, cu puțină mobilitate și o trecere mai bună către efort, îți poate schimba complet nivelul de energie din următoarele ore.`,
-          `Al doilea punct este felul în care îți împarți mișcarea peste zi. Dacă stai mult și apoi încerci să recuperezi totul dintr-odată, corpul intră ușor în tensiune și oboseala se simte și mai tare.`,
-          `Al treilea lucru este să reduci așteptarea că ai nevoie de perfecțiune. Pentru publicul acesta, progresul vine mai repede din pași simpli și constanți decât din perioade scurte în care tragi foarte tare și apoi cazi complet.`,
+          `Primul slide sparge mitul că doar antrenamentele lungi contează. Pentru mulți ${audienceLabel}, progresul începe atunci când timpul mic devine predictibil și bine folosit.`,
+          `Al doilea slide arată regula simplă: mai puține exerciții, mai puține decizii și o ordine clară. Cu cât sesiunea e mai simplă, cu atât cresc șansele să o repeți și mâine.`,
+          `Al treilea slide explică beneficiul real: nu doar consumi calorii, ci construiești ritm, control și senzația că te poți ține de ceva chiar și în zilele aglomerate.`,
+          `Ultimul slide închide ideea: dacă nu ai timp mult, nu înseamnă că n-ai opțiuni. Ai nevoie doar de o structură care respectă viața reală, nu una idealizată.`,
         ],
         'Slide CAROUSEL'
       ),
-      cta: 'Scrie ECHILIBRU în DM și îți trimit schema simplă cu pașii de bază.',
+      cta: 'Scrie TIMP în DM și îți trimit schema scurtă pentru zile aglomerate.',
       objective: 'Generare lead-uri',
       conversionRate: 0,
       leadMagnet: baseLeadMagnet,
-      dmKeyword: 'ECHILIBRU',
-      reasoning: `Carousel-ul funcționează pentru că organizează informația într-o formă ușor de parcurs și de salvat. Publicul vede clar unde greșește și ce poate ajusta fără să simtă că primește o soluție complicată. Hook-ul promite claritate, iar CTA-ul cere un gest mic, cu beneficiu imediat și relevant.`,
+      dmKeyword: 'TIMP',
+      reasoning: `Carousel-ul funcționează pentru că transformă obiecția de timp într-o discuție despre structură și decizii simple. Mesajul este ușor de salvat și util exact pentru cei care se simt presați de program.`,
     },
     story: {
       format: 'STORY',
-      hook: buildEmergencyHook('Dacă te doare tot și n-ai energie, oprește-te un minut'),
+      hook: buildEmergencyHook('Ai doar puțin timp? E suficient ca să începi'),
       script: buildEmergencyScenes(
         [
-          `Dacă simți că te trezești deja fără energie, nu e ceva ce trebuie ignorat. La mulți ${audienceLabel}, combinația dintre stres, stat mult și lipsa unei rutine simple se simte direct în corp.`,
-          `Nu începe cu planuri mari. Începe cu puțină mobilitate, mai multă atenție la postură și câteva pauze scurte care să te scoată din rigiditate.`,
-          `Când faci asta constant, nu doar că scade disconfortul, dar începi să simți că ai mai mult control peste zi. Asta îți crește și energia, și încrederea că poți rămâne consecvent.`,
-          `Dacă vrei varianta mea scurtă și clară, scrie START în DM și ți-o trimit imediat.`,
+          `Dacă aștepți momentul perfect, probabil n-o să vină prea curând. Pentru mulți ${audienceLabel}, progresul începe când acceptă că puțin făcut constant bate mult făcut rar.`,
+          `Nu trebuie să ai o oră liberă. Ai nevoie de 10-15 minute clare și de mai puține decizii înainte să începi.`,
+          `Când faci asta de câteva ori pe săptămână, corpul începe să răspundă și apare senzația că rutina chiar poate sta în viața ta.`,
+          `Dacă vrei varianta mea scurtă, scrie SCURT în DM.`,
         ],
         'Cadru STORY'
       ),
-      cta: 'Scrie START în DM și îți trimit pașii simpli pentru o zi cu mai puțin disconfort.',
+      cta: 'Scrie SCURT în DM și îți trimit planul simplu pentru zile fără timp.',
       objective: 'Generare lead-uri',
       conversionRate: 0,
       leadMagnet: baseLeadMagnet,
-      dmKeyword: 'START',
-      reasoning: `Story-ul merge bine pentru că mesajul este direct, ușor de consumat și are urgență naturală. Problema este formulată simplu, fără jargon, iar soluția pare realistă pentru cineva cu program încărcat. CTA-ul este scurt și foarte ușor de executat.`,
+      dmKeyword: 'SCURT',
+      reasoning: `Story-ul merge bine pentru că reduce presiunea și creează un prag mic de intrare. Exact asta are nevoie publicul când obiecția principală este timpul. CTA-ul continuă firesc ideea.`,
     },
     source: 'emergency-fallback',
   };
@@ -1490,6 +2367,7 @@ async function generateMultiFormatIdeaTaggedFallback(
   const objective = input.objective || 'lead-gen';
   const isGeneralIdea = input.general === true;
   const recentIdeasSection = buildRecentIdeasSection(input.recentIdeas);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
   const contentCreationSection = buildContentCreationSection(input.contentPreferences);
 
@@ -1508,12 +2386,17 @@ ${contentCreationSection}
 ISTORIC IDEI RECENTE:
 ${recentIdeasSection}
 
+${antiRepeatSection}
+
 REGULI:
 - Totul exclusiv în română naturală.
 - Cele 3 idei trebuie să fie clar diferite între ele.
 - Hook-ul trebuie să fie specific și complet.
 - Fiecare scenă trebuie să fie clară și utilă.
 - CTA-ul trebuie să includă un keyword DM și un beneficiu clar.
+- CTA-ul stă exclusiv în tag-ul CTA, nu în scene.
+- Scenele 4 / ultimul slide trebuie să închidă ideea cu o concluzie practică, un principiu util sau un ultim pas clar, fără CTA.
+- Nu pune în nicio scenă formulări de tipul "scrie în DM", "comentează", "salvează" sau alte invitații la acțiune.
 - Fără markdown. Fără JSON. Fără explicații extra.
 - Returnează EXACT tag-urile de mai jos.
 
@@ -1601,20 +2484,19 @@ FORMAT EXACT:
 }
 
 async function generateStructuredIdeaTaggedFallback(
-  input: {
-    ideaText: string;
-    niche: string;
-    contentPreferences?: any;
-  },
+  input: StructureUserIdeaInput,
   fallbackCtaStyle: string
 ): Promise<StructuredIdeaResult> {
   const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const prompt = `Rescrie ideea utilizatorului ca output structurat pentru un Reel.
 
 NIȘĂ: "${input.niche}"
 BRAND VOICE:
 ${brandVoiceSection}
 STIL CTA: ${fallbackCtaStyle}
+
+${antiRepeatSection}
 
 IDEA UTILIZATOR:
 """
@@ -1624,9 +2506,14 @@ ${input.ideaText}
 Returnează DOAR text cu tag-urile de mai jos, fără markdown și fără explicații extra.
 - Păstrează tonul conversațional.
 - Fiecare secțiune trebuie să fie clară, completă și utilă.
-- Fiecare secțiune trebuie să aibă aproximativ 90-140 cuvinte.
+- Fiecare secțiune trebuie să aibă aproximativ 70-120 cuvinte.
 - CTA-ul trebuie să fie clar și acționabil.
 - improvements trebuie să fie exact cele 4 itemi din format.
+- NU descrie cum ar trebui scris mesajul.
+- NU folosi formulări meta ca: "ideea trebuie", "mesajul trebuie", "în partea asta", "poți spune".
+- Scrie direct varianta finală, ca text vorbit, cu flow natural între secțiuni.
+- Hook-urile trebuie să fie scurte, memorabile și naturale, nu să repete brut textul utilizatorului.
+- Dacă utilizatorul povestește ceva personal, păstrează acel unghi personal.
 
 FORMAT EXACT:
 <mainIdea>...</mainIdea>
@@ -2576,6 +3463,7 @@ Clar > impresionant
 export async function generateDailyIdea(input: DailyIdeaInput): Promise<DailyIdeaResult> {
   const objective = input.objective || 'lead-gen';
   const recentIdeasSection = buildRecentIdeasSection(input.recentIdeas);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
   const contentCreationSection = buildContentCreationSection(input.contentPreferences);
   const icpProfileText =
@@ -2638,12 +3526,16 @@ REGULI DE UNICITATE (OBLIGATORIU):
    - tipul de exemplu practic
 4. Ideea trebuie să fie distinctă semantic, nu doar reformulată.
 
+${antiRepeatSection}
+
 Generează o idee completă de postare Instagram/TikTok care:
 1. Hook-ul TREBUIE să menționeze direct problema/audiența din nișă (ex: pentru "mame după sarcină" → hook despre mame, nu generic)
 2. Script-ul rezolvă PROBLEMA SPECIFICĂ a clientului ideal descris mai sus
 3. CTA-ul oferă un lead magnet RELEVANT pentru nișă
 4. Fiecare scenă vorbește DIRECT către clientul ideal
 5. Evită orice generalizări - fii SPECIFIC și TARGETAT
+6. CTA-ul trebuie să existe doar în câmpul "cta", nu în nicio scenă
+7. Ultima scenă trebuie să închidă ideea cu un principiu util, o concluzie practică sau un ultim pas clar, nu cu invitație la DM/comentariu/salvare
 
 REGULI STRICTE:
 ✗ NU folosi hook-uri generice ("Vrei să slăbești?", "3 trucuri pentru...")
@@ -2669,6 +3561,7 @@ REGULĂ LINGVISTICĂ FINALĂ:
 IMPORTANT PENTRU SCRIPT - CERINȚE DETALIATE:
 - Pentru fiecare scenă/slide, câmpul "text" trebuie să fie FOARTE DETALIAT și COMPLET
 - Minim 4-6 propoziții per scenă (≈ 80-150 de cuvinte), în română naturală și conversațională
+- Nicio scenă nu are voie să conțină formulări de tipul "scrie în DM", "comentează", "salvează", "swipe up", "trimite mesaj" sau alte CTA-uri mascate
 - Include:
   * Tranziții naturale ("Acum să-ți arăt...", "Uite ce se întâmplă...", "De ce funcționează?", "Hai să vorbim despre...")
   * Exemple SPECIFICE și CONCRETE din nișă (nu generalizări)
@@ -2720,6 +3613,7 @@ export async function generateMultiFormatIdea(input: DailyIdeaInput): Promise<Mu
   const objective = input.objective || 'lead-gen';
   const isGeneralIdea = input.general === true;
   const recentIdeasSection = buildRecentIdeasSection(input.recentIdeas);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
   const contentCreationSection = buildContentCreationSection(input.contentPreferences);
   const icpProfileText =
@@ -2729,9 +3623,12 @@ export async function generateMultiFormatIdea(input: DailyIdeaInput): Promise<Mu
         ? input.icpProfile
         : JSON.stringify(input.icpProfile);
   
-  const prompt = `Generezi 3 idei de content pentru un antrenor fitness din România.
+  const buildDelimitedPrompt = (targets: MultiFormatIdeaKey[], retryReason?: string) => `Generezi ${
+    targets.length === 3 ? '3 idei de content' : `${targets.length} idei de content`
+  } pentru un antrenor fitness din România.
 
-Scrie exclusiv în română naturală. Fără romgleză. Fără markdown. Fără explicații în afara JSON-ului.
+Scrie exclusiv în română naturală. Fără romgleză. Fără markdown. Fără JSON.
+Toate valorile trebuie să stea pe un singur rând. Nu folosi line breaks în interiorul câmpurilor.
 
 CONTEXT:
 - Mod: ${isGeneralIdea ? 'general' : 'bazat pe nișă'}
@@ -2748,104 +3645,89 @@ ${contentCreationSection}
 ISTORIC IDEI RECENTE:
 ${recentIdeasSection}
 
+${antiRepeatSection}
+
 REGULI:
-- Cele 3 idei trebuie să fie clar diferite între ele.
+- Ideile cerute trebuie să fie clar diferite între ele și diferite de istoricul recent.
 - Nu reutiliza hook-uri, CTA-uri sau aceeași problemă principală din istoric.
 - Toate ideile trebuie să fie specifice contextului dat.
 - Hook-urile trebuie să fie complete, clare și naturale.
 - CTA-ul trebuie să includă keyword DM și beneficiu clar.
+- CTA-ul stă exclusiv în câmpul "cta", nu în scene.
+- Scena 4 / ultimul slide trebuie să închidă ideea cu o concluzie practică, un principiu util sau un ultim pas clar, fără CTA.
+- Nu pune în nicio scenă formulări de tipul "scrie în DM", "comentează", "salvează", "trimite mesaj" sau alte invitații la acțiune.
 - Visual-urile trebuie să fie scurte și filmabile.
 - Evită formulările vagi, academice sau traduse prost.
+- Hook și CTA: pe un singur rând.
+- Fiecare scenă: pe un singur rând.
+- DM keyword: un singur cuvânt sau maxim două cuvinte scurte.
+- Dacă refaci doar o parte lipsă, livrezi DOAR secțiunile cerute acum.
+${retryReason ? `- CONTEXT RETRY: ${retryReason}` : ''}
 
 STRUCTURĂ:
 - REEL: 4 scene, 30-55 cuvinte per scenă, 1 hook, 1 CTA
 - CAROUSEL: 4 scene/slides, 45-70 cuvinte per scenă, 1 hook, 1 CTA
 - STORY: 4 scene, 20-45 cuvinte per scenă, 1 hook, 1 CTA
 
-Răspunde DOAR în JSON valid.
-- Folosește doar ghilimele duble corect escapate.
-- Nu include newline-uri literale în stringuri.
-- Nu include trailing commas.
-
-FORMAT:
-{
-  "reel": {
-    "format": "REEL",
-    "hook": "Hook scurt și specific",
-    "script": [
-      {"scene": 1, "text": "Scena 1", "visual": "Vizual 1"},
-      {"scene": 2, "text": "Scena 2", "visual": "Vizual 2"},
-      {"scene": 3, "text": "Scena 3", "visual": "Vizual 3"},
-      {"scene": 4, "text": "Scena 4", "visual": "Vizual 4"}
-    ],
-    "cta": "CTA cu keyword DM și beneficiu clar",
-    "objective": "Generare lead-uri",
-    "conversionRate": 45,
-    "leadMagnet": "Lead magnet specific",
-    "dmKeyword": "KEYWORD",
-    "reasoning": "Explicație scurtă de ce funcționează"
-  },
-  "carousel": {
-    "format": "CAROUSEL",
-    "hook": "Hook scurt și specific",
-    "script": [
-      {"scene": 1, "text": "Slide 1", "visual": "Vizual 1"},
-      {"scene": 2, "text": "Slide 2", "visual": "Vizual 2"},
-      {"scene": 3, "text": "Slide 3", "visual": "Vizual 3"},
-      {"scene": 4, "text": "Slide 4", "visual": "Vizual 4"}
-    ],
-    "cta": "CTA cu keyword DM și beneficiu clar",
-    "objective": "Generare lead-uri",
-    "conversionRate": 42,
-    "leadMagnet": "Lead magnet specific",
-    "dmKeyword": "KEYWORD",
-    "reasoning": "Explicație scurtă de ce funcționează"
-  },
-  "story": {
-    "format": "STORY",
-    "hook": "Hook scurt și specific",
-    "script": [
-      {"scene": 1, "text": "Scena 1", "visual": "Vizual 1"},
-      {"scene": 2, "text": "Scena 2", "visual": "Vizual 2"},
-      {"scene": 3, "text": "Scena 3", "visual": "Vizual 3"},
-      {"scene": 4, "text": "Scena 4", "visual": "Vizual 4"}
-    ],
-    "cta": "CTA cu keyword DM și beneficiu clar",
-    "objective": "Generare lead-uri",
-    "conversionRate": 38,
-    "leadMagnet": "Lead magnet specific",
-    "dmKeyword": "KEYWORD",
-    "reasoning": "Explicație scurtă de ce funcționează"
-  }
-}`;
+Răspunde DOAR în formatul exact de mai jos:
+${buildDelimitedFormatInstructions(targets)}`;
 
   console.log(`🎯 Generating multi-format ideas for niche: "${input.niche}"`);
 
-  const parseResponse = async () => {
-    const content = await generateGeminiJson(prompt, 0.8, 6000);
+  const generateDelimitedResponse = async (targets: MultiFormatIdeaKey[], retryReason?: string) => {
+    const content = await generateGeminiText(buildDelimitedPrompt(targets, retryReason), 0.65, 5200);
     console.log(`✅ Gemini multi-format response received (${content.length} chars) [model=${GEMINI_MODEL}]`);
+    return content;
+  };
 
-    try {
-      const parsed = await parseModelJson<MultiFormatIdeaResult>(content);
-      return normalizeMultiFormatIdeaResult(parsed);
-    } catch (error) {
-      console.warn(`Gemini multi-format raw preview: ${previewModelResponse(content)}`);
-      throw error;
-    }
+  const parseDelimitedResponse = (content: string, source: MultiFormatIdeaResult['source']) => {
+    const { parsed, missing } = parseDelimitedMultiFormatIdeaContent(content);
+    return {
+      parsed,
+      missing,
+      result: missing.length === 0 ? assembleMultiFormatIdeaResult(parsed, source) : null,
+    };
   };
 
   let result: MultiFormatIdeaResult;
   try {
-    result = await parseResponse();
+    const firstContent = await generateDelimitedResponse(['reel', 'carousel', 'story']);
+    let { parsed, missing, result: parsedResult } = parseDelimitedResponse(firstContent, 'ai');
+
+    if (missing.length > 0) {
+      console.warn(
+        `Multi-format delimited response incomplete, retrying only missing sections: ${missing.join(', ')}`
+      );
+      console.warn(`Gemini multi-format raw preview: ${previewModelResponse(firstContent)}`);
+
+      const retryContent = await generateDelimitedResponse(
+        missing,
+        `Lipseau sau erau incomplete secțiunile: ${missing.join(', ')}. Refă doar aceste secțiuni complet.`
+      );
+      const retryParsed = parseDelimitedMultiFormatIdeaContent(retryContent);
+
+      parsed = {
+        ...parsed,
+        ...retryParsed.parsed,
+      };
+      missing = (['reel', 'carousel', 'story'] as MultiFormatIdeaKey[]).filter((key) => !parsed[key]);
+      parsedResult = missing.length === 0 ? assembleMultiFormatIdeaResult(parsed, 'ai') : null;
+    }
+
+    if (!parsedResult) {
+      throw new Error(`Delimited multi-format response incomplete after retry: ${missing.join(', ')}`);
+    }
+
+    result = parsedResult;
   } catch (error) {
-    console.warn('Multi-format idea parsing failed on first attempt, switching to tagged fallback:', error);
+    console.warn('Multi-format delimited generation failed, switching to tagged fallback:', error);
 
     try {
       result = await generateMultiFormatIdeaTaggedFallback(input);
       console.log(`✅ Gemini multi-format tagged fallback succeeded [model=${GEMINI_MODEL}]`);
     } catch (fallbackError) {
       console.warn('Multi-format tagged fallback failed, using emergency local fallback:', fallbackError);
-      result = buildMultiFormatIdeaEmergencyResult(input);
+      result = normalizeMultiFormatIdeaResult(buildMultiFormatIdeaEmergencyResult(input));
       console.log('✅ Multi-format emergency local fallback succeeded');
     }
   }
@@ -2857,56 +3739,146 @@ FORMAT:
   return result;
 }
 
-export async function structureUserIdea(input: {
-  ideaText: string;
-  niche: string;
-  contentPreferences?: any;
-}): Promise<StructuredIdeaResult> {
-  const { prompt, ctaStyle } = buildStructuredIdeaPrompt(input);
-  let normalizedResult: StructuredIdeaResult;
+export async function structureUserIdea(input: StructureUserIdeaInput): Promise<StructuredIdeaResult> {
+  const { ctaStyle } = buildStructuredIdeaPrompt(input);
+  const brandVoiceSection = buildBrandVoiceSection(input.contentPreferences);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const resolveGuaranteedStructuredIdea = async (): Promise<StructuredIdeaResult> => {
     try {
       const taggedFallback = await generateStructuredIdeaTaggedFallback(input, ctaStyle);
-      return isStructuredIdeaResultIncomplete(taggedFallback)
-        ? buildStructuredIdeaEmergencyResult(input)
-        : taggedFallback;
+      console.log(`🧩 Structured idea tagged fallback returned hooks: "${taggedFallback.hooks[0]}" | "${taggedFallback.hooks[1]}"`);
+      if (!isStructuredIdeaResultIncomplete(taggedFallback)) {
+        return taggedFallback;
+      }
+
+      console.warn('Structured idea tagged fallback was incomplete, using emergency fallback.');
+      return buildStructuredIdeaEmergencyResult(input);
     } catch (error) {
       console.warn('Structured idea tagged fallback failed, using emergency fallback:', error);
       return buildStructuredIdeaEmergencyResult(input);
     }
   };
 
-  const parsePrimaryStructuredIdea = async (): Promise<StructuredIdeaResult> => {
-    const content = await generateGeminiJson(prompt, 0.45, 3400);
-    return normalizeStructuredIdeaResult(
-      await parseModelJson<StructuredIdeaResult>(content),
-      ctaStyle
+  const buildDelimitedPrompt = (targets: StructuredIdeaBlockKey[], retryReason?: string) => `Transformă ideea brută a utilizatorului într-un script structurat pentru un Reel.
+
+NIȘĂ: "${input.niche}"
+BRAND VOICE:
+${brandVoiceSection}
+STIL CTA: ${ctaStyle}
+
+${antiRepeatSection}
+
+IDEA UTILIZATOR:
+"""
+${input.ideaText}
+"""
+
+REGULI:
+- Scrie exclusiv în română naturală, ca text vorbit.
+- NU descrie cum ar trebui construit mesajul. Scrie direct varianta finală.
+- NU folosi formulări meta precum: "ideea trebuie", "mesajul trebuie", "în partea asta", "poți spune".
+- Dacă utilizatorul vorbește din experiență personală, păstrează acel unghi personal natural, dar curat.
+- Hook-urile trebuie să fie scurte, clare, memorabile și să nu repete brut ideea originală.
+- Fiecare secțiune trebuie să curgă firesc în următoarea.
+- Nu folosi bullets, markdown, JSON sau explicații extra.
+- Livrezi DOAR blocurile cerute acum.
+${retryReason ? `- CONTEXT RETRY: ${retryReason}` : ''}
+
+Răspunde DOAR în formatul exact de mai jos:
+${buildStructuredIdeaDelimitedFormatInstructions(targets)}`;
+
+  const generateDelimitedResponse = async (targets: StructuredIdeaBlockKey[], retryReason?: string) => {
+    const content = await generateGeminiText(buildDelimitedPrompt(targets, retryReason), 0.45, 3200);
+    console.log(
+      `✅ Gemini structured idea response received (${content.length} chars) [model=${GEMINI_MODEL}] [blocks=${targets.join(',')}]`
     );
+    return content;
   };
 
+  console.log(`🎯 Structuring user idea for niche: "${input.niche}"`);
+  console.log(`📝 Structured idea raw input preview: ${previewModelResponse(input.ideaText, 180)}`);
+
   try {
-    try {
-      normalizedResult = await parsePrimaryStructuredIdea();
-    } catch (error) {
-      console.warn('Structured idea primary parsing failed on first attempt, retrying once:', error);
-      normalizedResult = await parsePrimaryStructuredIdea();
+    const primaryContent = await generateDelimitedResponse([
+      'mainIdea',
+      'hook1',
+      'hook2',
+      'section1',
+      'section2',
+      'section3',
+      'section4',
+      'cta',
+    ]);
+
+    let { parsed, missing, result } = parseStructuredIdeaDelimitedContent(primaryContent, ctaStyle);
+
+    if (missing.length > 0 || !result) {
+      console.warn(
+        `Structured idea delimited response incomplete, retrying only missing blocks: ${missing.join(', ') || 'all'}`
+      );
+      console.warn(`Structured idea raw preview: ${previewModelResponse(primaryContent)}`);
+
+      const retryTargets =
+        missing.length > 0
+          ? missing
+          : (['mainIdea', 'hook1', 'hook2', 'section1', 'section2', 'section3', 'section4', 'cta'] as StructuredIdeaBlockKey[]);
+      const retryContent = await generateDelimitedResponse(
+        retryTargets,
+        `Lipseau sau erau slabe blocurile: ${retryTargets.join(', ')}. Refă doar aceste blocuri ca text final, natural și coerent.`
+      );
+      const retryParsed = parseStructuredIdeaDelimitedContent(retryContent, ctaStyle);
+
+      parsed = {
+        ...parsed,
+        ...retryParsed.parsed,
+      };
+
+      const mergedResult = parseStructuredIdeaDelimitedContent(
+        [
+          parsed.mainIdea ? `===MAIN_IDEA===\n${parsed.mainIdea}` : '',
+          parsed.hook1 ? `===HOOK1===\n${parsed.hook1}` : '',
+          parsed.hook2 ? `===HOOK2===\n${parsed.hook2}` : '',
+          parsed.section1 ? `===SECTION1===\n${parsed.section1}` : '',
+          parsed.section2 ? `===SECTION2===\n${parsed.section2}` : '',
+          parsed.section3 ? `===SECTION3===\n${parsed.section3}` : '',
+          parsed.section4 ? `===SECTION4===\n${parsed.section4}` : '',
+          parsed.cta ? `===CTA===\n${parsed.cta}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+        ctaStyle
+      );
+
+      missing = mergedResult.missing;
+      result = mergedResult.result;
     }
-  } catch (error) {
-    console.warn('Structured idea JSON parsing failed, switching to tagged fallback:', error);
-    return resolveGuaranteedStructuredIdea();
-  }
 
-  if (!isStructuredIdeaResultIncomplete(normalizedResult)) {
-    return normalizedResult;
-  }
+    if (!result) {
+      const acceptedFullAiResult = acceptStructuredIdeaResultFromFullAiBlocks(parsed, ctaStyle);
+      if (acceptedFullAiResult) {
+        console.warn('Structured idea AI result had all blocks but failed strict validation; keeping repaired AI result.');
+        console.log(
+          `🧩 Structured idea accepted from repaired AI path with hooks: "${acceptedFullAiResult.hooks[0]}" | "${acceptedFullAiResult.hooks[1]}"`
+        );
+        return acceptedFullAiResult;
+      }
 
-  try {
-    const completedResult = await generateStructuredIdeaFallback(input, normalizedResult, ctaStyle);
-    return isStructuredIdeaResultIncomplete(completedResult)
-      ? await resolveGuaranteedStructuredIdea()
-      : completedResult;
+      const rescued = rescueStructuredIdeaResultFromPartial(parsed, ctaStyle);
+      if (rescued) {
+        console.warn('Structured idea AI result was missing only weak/non-critical blocks; rescued result without full fallback.');
+        console.log(`🧩 Structured idea rescued from AI path with hooks: "${rescued.hooks[0]}" | "${rescued.hooks[1]}"`);
+        return rescued;
+      }
+    }
+
+    if (result) {
+      console.log(`🧩 Structured idea generated from AI path with hooks: "${result.hooks[0]}" | "${result.hooks[1]}"`);
+      return result;
+    }
+
+    throw new Error(`Structured idea delimited response incomplete after retry: ${missing.join(', ')}`);
   } catch (error) {
-    console.warn('Structured idea completion fallback failed, switching to tagged fallback:', error);
+    console.warn('Structured idea delimited generation failed, switching to tagged fallback:', error);
     return resolveGuaranteedStructuredIdea();
   }
 }
@@ -3006,6 +3978,7 @@ export interface ContentFeedbackInput {
   duration?: number;
   niche?: string; // Optional context
   transcription?: string; // Whisper transcription for video
+  generationContext?: GenerationPromptContext;
 }
 
 export interface Suggestion {
@@ -3109,6 +4082,7 @@ function normalizeContentFeedbackResult(
 }
 
 export async function analyzeFeedback(input: ContentFeedbackInput): Promise<ContentFeedbackResult> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   console.log(`🔍 analyzeFeedback called with:`, {
     fileType: input.fileType,
     hasNiche: !!input.niche,
@@ -3177,6 +4151,8 @@ IMPORTANT: Dă 3-5 sugestii CONCRETE și ACȚIONABILE bazate pe ${input.transcri
 - "warning": Oportunitate ratată care ar putea dubla performanța
 - "success": Ceva care funcționează FOARTE bine și trebuie păstrat
 
+${antiRepeatSection}
+
 Răspunde DOAR în format JSON strict, fără markdown:
 {
   "clarityScore": 82,
@@ -3240,6 +4216,7 @@ export interface NicheDiscoverPhaseAInput {
   commonProblems: string[];
   primaryOutcome: string;
   avoidContent: string[];
+  generationContext?: GenerationPromptContext;
 }
 
 export interface NicheVariant {
@@ -3471,6 +4448,7 @@ function buildFallbackNicheVariants(input: NicheDiscoverPhaseAInput): NicheVaria
 }
 
 export async function generateNicheVariants(input: NicheDiscoverPhaseAInput): Promise<{ variants: NicheVariant[] }> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const prompt = `Tu ești un expert în marketing fitness. Pe baza răspunsurilor antrenorului, propune EXACT 3 variante de nișă.
 
 RĂSPUNSURI ANTRENOR:
@@ -3481,6 +4459,8 @@ RĂSPUNSURI ANTRENOR:
 🚨 Problemă explicată cel mai des: ${input.commonProblems.join(', ')}
 ✅ Ce vrea să rezolve în 2-3 luni: ${input.primaryOutcome}
 ❌ Content de evitat: ${input.avoidContent.join(', ') || 'N/A'}
+
+${antiRepeatSection}
 
 Creează EXACT 3 variante de nișă diferite. Fiecare variantă:
 - "variant": Titlul nișei (1 propoziție scurtă, specifică)
@@ -3544,7 +4524,10 @@ FORMAT:
   return { variants };
 }
 
-export async function generatePresetNicheOptions(): Promise<{ niches: PresetNicheOption[] }> {
+export async function generatePresetNicheOptions(
+  generationContext?: GenerationPromptContext
+): Promise<{ niches: PresetNicheOption[] }> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(generationContext);
   const prompt = `Tu ești un expert în marketing fitness pentru antrenori din România.
 
 Generează EXACT 5 nișe prestabilite în limba română pe care un fitness coach din România le-ar putea alege rapid.
@@ -3556,6 +4539,8 @@ CERINȚE:
 - "niche" = titlu scurt, clar, ușor de ales dintr-un click.
 - "description" = 1-2 propoziții despre cui se adresează și ce rezultat urmărește.
 - Tot output-ul trebuie să fie exclusiv în română naturală.
+
+${antiRepeatSection}
 
 Răspunde DOAR în JSON strict.
 
@@ -3645,9 +4630,11 @@ export interface NicheDiscoverInput {
   evening?: string[];
   definingSituations?: string[];
   notes?: string;
+  generationContext?: GenerationPromptContext;
 }
 
 export async function generateNicheDiscover(input: NicheDiscoverInput): Promise<NicheResult> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const prompt = `Tu ești un expert în marketing fitness. Antrenorul a ales nișa "${input.selectedNiche}" și acum vrei să o rafinezi pe baza răspunsurilor detaliate.
 
 Creează:
@@ -3685,6 +4672,8 @@ ZIUA TIPICĂ A CLIENTULUI:
 🌙 Seara: ${input.evening?.join(', ') || 'N/A'}
 ⭐ Situații: ${input.definingSituations?.join(', ') || 'N/A'}
 ${input.notes ? `📝 Note: ${input.notes}` : ''}
+
+${antiRepeatSection}
 
 INSTRUCȚIUNI:
 - "niche": Rafinează nișa aleasă să fie SUPER precisă (include vârsta, situația, obiectivul principal)
@@ -3745,9 +4734,11 @@ export interface ICPDayInput {
   evening?: string[];
   definingSituations?: string[];
   notes?: string;
+  generationContext?: GenerationPromptContext;
 }
 
 export async function generateICPDay(input: ICPDayInput): Promise<{ icpProfile: string }> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const prompt = `Tu ești un expert în marketing fitness. Pe baza informațiilor despre ziua tipică a clientului ideal, creează un profil ICP detaliat (3-4 paragrafe) care descrie:
 
 1. Demografic (gen, vârstă)
@@ -3768,6 +4759,8 @@ INFORMAȚII CLIENT IDEAL:
 ⭐ Situații definitorii: ${input.definingSituations?.join(', ') || 'N/A'}
 ${input.notes ? `📝 Note: ${input.notes}` : ''}
 
+${antiRepeatSection}
+
 Scrie un profil de client ideal natural, în română, 3-4 paragrafe. NU folosi bullet points, doar proză.
 
 Răspunde DOAR cu textul profilului (fără JSON, fără markdown).`;
@@ -3785,9 +4778,11 @@ export interface TextContentFeedbackInput {
   icpProfile?: any;
   positioningMessage?: string;
   toneOfVoice?: string;
+  generationContext?: GenerationPromptContext;
 }
 
 export async function analyzeTextContent(input: TextContentFeedbackInput): Promise<ContentFeedbackResult> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const formatInstructions = {
     reel: 'REEL (30-60 secunde, 4-6 scene): Hook dinamic, script energic, vizual puternic',
     carousel: 'CAROUSEL (6-9 slide-uri): Hook intrigant, fiecare slide = un pas/idee, perfect pentru liste',
@@ -3864,6 +4859,8 @@ ${contextSection ? `\n⚠️ CRITICI BRUTALE: Fii EXTREM de specific și detalia
 
 Categorii pentru sugestii: "hook", "clarity", "social-proof", "cta", "structure", "relevance", "trust", "format", "storytelling", "pain-points", "positioning"
 
+${antiRepeatSection}
+
 Răspunde DOAR în format JSON strict, fără markdown:
 {
   "clarityScore": 82,
@@ -3925,6 +4922,7 @@ export interface GenerateMarketingEmailInput {
   audiencePain?: string;
   ctaGoal?: string;
   language: 'ro' | 'en';
+  generationContext?: GenerationPromptContext;
   userContext: {
     name?: string;
     niche?: string;
@@ -3945,6 +4943,7 @@ export interface MarketingEmailResult {
 export async function generateMarketingEmail(
   input: GenerateMarketingEmailInput
 ): Promise<MarketingEmailResult> {
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
   const icp =
     typeof input.userContext.icpProfile === 'string'
       ? input.userContext.icpProfile
@@ -3980,6 +4979,8 @@ CERINȚE:
 5) Subject options să fie scurte și clare (max ~60 caractere).
 6) Preview text max ~120 caractere.
 7) Body max 350 cuvinte.
+
+${antiRepeatSection}
 
 Răspunde DOAR JSON strict:
 {
@@ -4051,6 +5052,7 @@ export interface GenerateClientNutritionPlanInput {
     | 'macros-plus-examples'
     | 'flexible-template'
     | 'full-day-with-alternatives';
+  generationContext?: GenerationPromptContext;
 }
 
 export interface NutritionMealFood {
@@ -4109,6 +5111,7 @@ export async function generateClientNutritionPlan(
   input: GenerateClientNutritionPlanInput
 ): Promise<NutritionPlanResult> {
   const mealsPerDay = getMealsPerDay(input);
+  const antiRepeatSection = buildAntiRepeatPromptSection(input.generationContext);
 
   const prompt = `Tu ești un nutriționist sportiv senior pentru clienți fitness.
 
@@ -4124,6 +5127,8 @@ Planul alimentar trebuie să respecte următoarele principii:
 - Planul alimentar trebuie să respecte toate datele introduse de utilizator, inclusiv obiectivul, necesarul caloric și distribuția macronutrienților.
 La fiecare generare, creează un plan alimentar nou și variat.
 Evită reutilizarea acelorași tipare de meniu sau a acelorași combinații alimentare din planurile generate anterior.
+
+${antiRepeatSection}
 
 DATE CLIENT:
 - Calorii: ${input.calories}
